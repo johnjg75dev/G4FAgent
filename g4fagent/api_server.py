@@ -1,3 +1,5 @@
+"""Development HTTP API server for G4FAgent runtime workflows and tooling."""
+
 from __future__ import annotations
 
 import datetime as dt
@@ -14,33 +16,39 @@ import time
 import uuid
 import zipfile
 from collections import deque
+from copy import deepcopy
 from dataclasses import dataclass, field
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Pattern, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Pattern, Tuple, Union
 from urllib.parse import parse_qs, urlparse
 from urllib.request import Request, urlopen
 
 from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH
 from .core import G4FManager, list_known_model_names, list_known_model_names_for_provider
+from .database import Database, create_database
 from .tools import ToolRuntime
 from .utils import now_iso
 
 
 def _utc_now_iso() -> str:
+    """Return the current UTC timestamp as an ISO-8601 string."""
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
 
 def _slugify(value: str) -> str:
+    """Normalize a value into a filesystem-safe slug."""
     cleaned = re.sub(r"[^a-zA-Z0-9_-]+", "-", str(value).strip().lower()).strip("-")
     return cleaned or "project"
 
 
 def _sha256_text(value: str) -> str:
+    """Return the SHA-256 hex digest for a UTF-8 text value."""
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
 
 
 def _safe_int(value: Any, default: int) -> int:
+    """Safely coerce a value to `int`, falling back to the provided default."""
     try:
         return int(value)
     except Exception:
@@ -48,6 +56,7 @@ def _safe_int(value: Any, default: int) -> int:
 
 
 def _safe_float(value: Any, default: float) -> float:
+    """Safely coerce a value to `float`, falling back to the provided default."""
     try:
         return float(value)
     except Exception:
@@ -55,6 +64,7 @@ def _safe_float(value: Any, default: float) -> float:
 
 
 def _query_first(query: Mapping[str, List[str]], key: str, default: Optional[str] = None) -> Optional[str]:
+    """Return the first value for a query parameter key."""
     values = query.get(key)
     if not values:
         return default
@@ -62,6 +72,7 @@ def _query_first(query: Mapping[str, List[str]], key: str, default: Optional[str
 
 
 def _query_bool(query: Mapping[str, List[str]], key: str, default: bool = False) -> bool:
+    """Parse a query parameter as a boolean flag."""
     raw = _query_first(query, key)
     if raw is None:
         return default
@@ -69,6 +80,7 @@ def _query_bool(query: Mapping[str, List[str]], key: str, default: bool = False)
 
 
 def _coerce_iso(value: str) -> Optional[dt.datetime]:
+    """Parse an ISO-8601 datetime string into a `datetime` object."""
     text = str(value).strip()
     if not text:
         return None
@@ -81,6 +93,7 @@ def _coerce_iso(value: str) -> Optional[dt.datetime]:
 
 
 def _json_type_label(value: Any) -> str:
+    """Return a compact label describing the JSON-compatible value type."""
     if isinstance(value, bool):
         return "boolean"
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -97,6 +110,7 @@ def _json_type_label(value: Any) -> str:
 
 
 class ApiError(Exception):
+    """Represent an API exception with HTTP status and machine-readable details."""
     def __init__(
         self,
         status_code: int,
@@ -106,6 +120,7 @@ class ApiError(Exception):
         details: Optional[Dict[str, Any]] = None,
         retryable: bool = False,
     ) -> None:
+        """Initialize a `ApiError` instance."""
         super().__init__(message)
         self.status_code = int(status_code)
         self.code = str(code)
@@ -116,6 +131,7 @@ class ApiError(Exception):
 
 @dataclass
 class ApiResponse:
+    """Represent an HTTP response returned by API route handlers."""
     status_code: int
     body: Any
     content_type: str = "application/json"
@@ -124,6 +140,7 @@ class ApiResponse:
 
 @dataclass
 class Route:
+    """Represent a compiled route template and its request handler."""
     method: str
     template: str
     regex: Pattern[str]
@@ -132,10 +149,13 @@ class Route:
 
 
 class Router:
+    """Provide method+path routing for the lightweight API server."""
     def __init__(self) -> None:
+        """Initialize a `Router` instance."""
         self._routes: List[Route] = []
 
     def _compile_template(self, template: str) -> Pattern[str]:
+        """Compile template."""
         parts = [part for part in template.strip("/").split("/") if part]
         if not parts:
             return re.compile(r"^/$")
@@ -151,6 +171,7 @@ class Router:
         return re.compile("^/" + "/".join(regex_parts) + "$")
 
     def add(self, method: str, template: str, handler: Callable[["RequestContext"], ApiResponse], *, auth_required: bool = True) -> None:
+        """Register a route handler for an HTTP method and path template."""
         self._routes.append(
             Route(
                 method=method.upper(),
@@ -162,6 +183,7 @@ class Router:
         )
 
     def match(self, method: str, path: str) -> Tuple[Optional[Route], Dict[str, str]]:
+        """Resolve a method/path pair to a registered route and path parameters."""
         method = method.upper()
         for route in self._routes:
             if route.method != method:
@@ -172,17 +194,20 @@ class Router:
         return None, {}
 
     def allows_path(self, path: str) -> bool:
+        """Return whether any registered route template matches the given path."""
         for route in self._routes:
             if route.regex.match(path):
                 return True
         return False
 
     def endpoint_list(self) -> List[Dict[str, str]]:
+        """Return all registered endpoints as method/path pairs."""
         return [{"method": route.method, "path": route.template} for route in self._routes]
 
 
 @dataclass
 class RequestContext:
+    """Carry normalized request data for API route handlers."""
     state: "DevApiState"
     method: str
     path: str
@@ -196,6 +221,7 @@ class RequestContext:
     _json_parsed: bool = field(default=False, init=False, repr=False)
 
     def json(self, *, required: bool = False) -> Dict[str, Any]:
+        """Parse and return the request JSON body as an object."""
         if not self._json_parsed:
             self._json_parsed = True
             if not self.body_bytes:
@@ -214,6 +240,42 @@ class RequestContext:
 
 
 class DevApiState:
+    """Own server state, persistence, authorization, and endpoint handlers."""
+    _PERSISTED_DICT_FIELDS = (
+        "settings",
+        "projects",
+        "project_sessions",
+        "project_diffs",
+        "project_deployments",
+        "project_workflows",
+        "project_artifacts",
+        "project_telemetry_streams",
+        "sessions",
+        "session_messages",
+        "messages",
+        "session_runs",
+        "runs",
+        "run_events",
+        "diffs",
+        "deployments",
+        "deployment_logs",
+        "workflows",
+        "artifacts",
+        "uploads",
+        "file_meta",
+        "notifications",
+        "alerts",
+        "dynamic_tools",
+        "users",
+        "user_passwords",
+        "access_tokens",
+        "refresh_tokens",
+    )
+    _PERSISTED_LIST_FIELDS = (
+        "audit_events",
+        "settings_audit_events",
+    )
+
     def __init__(
         self,
         *,
@@ -223,7 +285,9 @@ class DevApiState:
         tools_dirs: Optional[Iterable[str]] = None,
         auth_disabled: bool = False,
         api_key: str = "dev-api-key",
+        database: Optional[Database] = None,
     ) -> None:
+        """Initialize a `DevApiState` instance."""
         normalized_base = "/" + str(base_path or "/api/v1").strip("/")
         if normalized_base == "//":
             normalized_base = "/"
@@ -237,6 +301,7 @@ class DevApiState:
         self.tools_dirs = list(tools_dirs or [])
         self.auth_disabled = bool(auth_disabled)
         self.api_key = str(api_key)
+        self.database = database
         self.router = Router()
         self._lock = threading.RLock()
         self._request_metrics: deque[Tuple[float, float]] = deque(maxlen=5000)
@@ -313,9 +378,11 @@ class DevApiState:
         self.access_token_ttl_s = max(60, _safe_int(os.getenv("G4FAGENT_ACCESS_TOKEN_TTL", 3600), 3600))
         self.refresh_token_ttl_s = max(60, _safe_int(os.getenv("G4FAGENT_REFRESH_TOKEN_TTL", 86400), 86400))
         self._seed_default_users()
+        self._hydrate_state_from_database()
         self._register_routes()
 
     def _seed_default_users(self) -> None:
+        """Seed the in-memory user store with the default admin account."""
         admin_id = "user_admin"
         admin = {
             "id": admin_id,
@@ -328,7 +395,59 @@ class DevApiState:
         self.users[admin_id] = admin
         self.user_passwords[admin_id] = os.getenv("G4FAGENT_ADMIN_PASSWORD", "admin")
 
+    def _snapshot_database_state(self) -> Dict[str, Any]:
+        """Build a serializable snapshot of persisted API state."""
+        with self._lock:
+            snapshot: Dict[str, Any] = {}
+            for field_name in self._PERSISTED_DICT_FIELDS:
+                snapshot[field_name] = deepcopy(getattr(self, field_name))
+            snapshot["project_paths"] = {str(project_id): str(path) for project_id, path in self.project_paths.items()}
+            for field_name in self._PERSISTED_LIST_FIELDS:
+                snapshot[field_name] = deepcopy(getattr(self, field_name))
+            return snapshot
+
+    def _restore_database_state(self, snapshot: Dict[str, Any]) -> None:
+        """Restore persisted API state from a previously stored snapshot."""
+        with self._lock:
+            for field_name in self._PERSISTED_DICT_FIELDS:
+                value = snapshot.get(field_name)
+                if isinstance(value, dict):
+                    setattr(self, field_name, deepcopy(value))
+            project_paths_raw = snapshot.get("project_paths")
+            if isinstance(project_paths_raw, dict):
+                restored_paths: Dict[str, Path] = {}
+                for project_id, raw_path in project_paths_raw.items():
+                    if not isinstance(raw_path, str):
+                        continue
+                    restored_paths[str(project_id)] = Path(raw_path).resolve()
+                self.project_paths = restored_paths
+            for field_name in self._PERSISTED_LIST_FIELDS:
+                value = snapshot.get(field_name)
+                if isinstance(value, list):
+                    setattr(self, field_name, deepcopy(value))
+
+    def _hydrate_state_from_database(self) -> None:
+        """Load persisted API state from the configured database."""
+        if self.database is None:
+            return
+        bucket = self.database.read_bucket("api_server")
+        snapshot = bucket.get("state")
+        if isinstance(snapshot, dict):
+            self._restore_database_state(snapshot)
+            if not self.users:
+                self._seed_default_users()
+                self._persist_database_state()
+            return
+        self._persist_database_state()
+
+    def _persist_database_state(self) -> None:
+        """Persist the current API state to the configured database."""
+        if self.database is None:
+            return
+        self.database.set("api_server", "state", self._snapshot_database_state())
+
     def _register_routes(self) -> None:
+        """Register all HTTP routes and their handler methods."""
         add = self.router.add
         add("GET", "/", self.handle_root, auth_required=False)
         add("GET", "/health", self.handle_health, auth_required=False)
@@ -413,9 +532,11 @@ class DevApiState:
         add("GET", "/stream/sessions/{session_id}", self.handle_stream_session)
 
     def _new_id(self, prefix: str) -> str:
+        """Generate a short random identifier with the given prefix."""
         return f"{prefix}_{uuid.uuid4().hex[:16]}"
 
     def _json_response(self, status_code: int, payload: Dict[str, Any], *, headers: Optional[Dict[str, str]] = None) -> ApiResponse:
+        """Create a JSON API response payload with optional headers."""
         return ApiResponse(status_code=status_code, body=payload, headers=headers or {})
 
     def _error_response(
@@ -428,6 +549,7 @@ class DevApiState:
         details: Optional[Dict[str, Any]] = None,
         retryable: bool = False,
     ) -> ApiResponse:
+        """Create a standardized API error response envelope."""
         body = {
             "error": {
                 "code": str(code),
@@ -448,6 +570,7 @@ class DevApiState:
         default_limit: int = 50,
         max_limit: int = 200,
     ) -> Tuple[List[Any], Optional[str]]:
+        """Paginate a list using `limit` and `cursor` query parameters."""
         limit = _safe_int(_query_first(query, "limit", str(default_limit)), default_limit)
         limit = max(1, min(max_limit, limit))
         cursor_raw = _query_first(query, "cursor", "0") or "0"
@@ -459,24 +582,28 @@ class DevApiState:
         return page, str(next_cursor)
 
     def _ensure_project(self, project_id: str) -> Dict[str, Any]:
+        """Return the requested project or raise `ApiError` if missing."""
         project = self.projects.get(project_id)
         if project is None:
             raise ApiError(404, "project_not_found", f"Project not found: {project_id}")
         return project
 
     def _ensure_session(self, session_id: str) -> Dict[str, Any]:
+        """Return the requested session or raise `ApiError` if missing."""
         session = self.sessions.get(session_id)
         if session is None:
             raise ApiError(404, "session_not_found", f"Session not found: {session_id}")
         return session
 
     def _ensure_run(self, run_id: str) -> Dict[str, Any]:
+        """Return the requested run or raise `ApiError` if missing."""
         run = self.runs.get(run_id)
         if run is None:
             raise ApiError(404, "run_not_found", f"Run not found: {run_id}")
         return run
 
     def _ensure_project_path(self, project_id: str) -> Path:
+        """Return the requested project path or raise `ApiError` if missing."""
         _ = self._ensure_project(project_id)
         path = self.project_paths.get(project_id)
         if path is None:
@@ -484,11 +611,13 @@ class DevApiState:
         return path
 
     def _safe_project_file_path(self, project_id: str, rel_path: str) -> Path:
+        """Safely process project file path."""
         root = self._ensure_project_path(project_id).resolve()
         raw = Path(str(rel_path))
         if raw.is_absolute():
             raise ApiError(400, "invalid_path", "Absolute paths are not allowed.")
         target = (root / raw).resolve()
+        # Block directory traversal so file operations always stay inside the project root.
         try:
             _ = target.relative_to(root)
         except Exception as exc:
@@ -496,6 +625,7 @@ class DevApiState:
         return target
 
     def _runtime_for_project(self, project_id: Optional[str]) -> ToolRuntime:
+        """Return the tool runtime scoped to a project or workspace."""
         key = project_id or "__workspace__"
         runtime = self._project_tool_runtimes.get(key)
         if runtime is not None:
@@ -506,11 +636,13 @@ class DevApiState:
         return runtime
 
     def _token_user(self, token: str) -> Optional[Dict[str, Any]]:
+        """Resolve user details from token state."""
         token_data = self.access_tokens.get(token)
         if not isinstance(token_data, dict):
             return None
         if token_data.get("expires_at", 0.0) < time.time():
             self.access_tokens.pop(token, None)
+            self._persist_database_state()
             return None
         user_id = str(token_data.get("user_id", ""))
         user = self.users.get(user_id)
@@ -519,6 +651,7 @@ class DevApiState:
         return user
 
     def _sanitize_user(self, user: Dict[str, Any]) -> Dict[str, Any]:
+        """Return a safe user payload suitable for API responses."""
         return {
             "id": user["id"],
             "name": user["name"],
@@ -528,6 +661,7 @@ class DevApiState:
         }
 
     def _issue_tokens(self, user_id: str) -> Dict[str, Any]:
+        """Issue tokens."""
         access_token = self._new_id("atk")
         refresh_token = self._new_id("rtk")
         now_ts = time.time()
@@ -540,6 +674,7 @@ class DevApiState:
         }
 
     def _authorize(self, headers: Mapping[str, str]) -> Optional[Dict[str, Any]]:
+        """Resolve and validate the caller from the Authorization header."""
         if self.auth_disabled:
             return self._sanitize_user(next(iter(self.users.values())))
         auth = headers.get("Authorization") or headers.get("authorization")
@@ -552,10 +687,12 @@ class DevApiState:
         return self._sanitize_user(user)
 
     def _record_request_metric(self, started: float) -> None:
+        """Record request metric information in server state."""
         ended = time.monotonic()
         self._request_metrics.append((ended, (ended - started) * 1000.0))
 
     def _record_audit(self, actor_user_id: str, event_type: str, data: Dict[str, Any], *, project_id: Optional[str] = None) -> None:
+        """Record audit information in server state."""
         event = {
             "id": self._new_id("audit"),
             "ts": _utc_now_iso(),
@@ -565,8 +702,10 @@ class DevApiState:
             "data": data,
         }
         self.audit_events.append(event)
+        self._persist_database_state()
 
     def _create_notification(self, level: str, title: str, body: str) -> None:
+        """Create and store a user-facing notification event."""
         notification = {
             "id": self._new_id("notif"),
             "ts": _utc_now_iso(),
@@ -576,8 +715,10 @@ class DevApiState:
             "acked": False,
         }
         self.notifications[notification["id"]] = notification
+        self._persist_database_state()
 
     def _provider_catalog(self) -> List[Dict[str, Any]]:
+        """Return catalog information."""
         now_ts = _utc_now_iso()
         return [
             {
@@ -635,11 +776,15 @@ class DevApiState:
         headers: Mapping[str, str],
         body_bytes: bytes,
     ) -> ApiResponse:
+        """Route an incoming HTTP request to the matching endpoint handler."""
         started = time.monotonic()
         request_id = self._new_id("req")
+        method_upper = method.upper()
+        mutating_method = method_upper in {"POST", "PUT", "PATCH", "DELETE"}
         try:
             parsed = urlparse(raw_path)
             request_path = parsed.path or "/"
+            # Normalize incoming URL paths relative to the configured API base path.
             if self.base_path != "/" and request_path == self.base_path:
                 subpath = "/"
             elif self.base_path == "/":
@@ -650,7 +795,7 @@ class DevApiState:
                 raise ApiError(404, "not_found", "Unknown API path.", details={"path": request_path})
             if not subpath.startswith("/"):
                 subpath = "/" + subpath
-            route, path_params = self.router.match(method, subpath)
+            route, path_params = self.router.match(method_upper, subpath)
             if route is None:
                 if self.router.allows_path(subpath):
                     raise ApiError(405, "method_not_allowed", "Method is not allowed for this path.")
@@ -658,7 +803,7 @@ class DevApiState:
             user = self._authorize(headers) if route.auth_required else None
             ctx = RequestContext(
                 state=self,
-                method=method.upper(),
+                method=method_upper,
                 path=subpath,
                 path_params=path_params,
                 query=parse_qs(parsed.query or "", keep_blank_values=True),
@@ -667,8 +812,13 @@ class DevApiState:
                 request_id=request_id,
                 user=user,
             )
-            return route.handler(ctx)
+            response = route.handler(ctx)
+            if mutating_method:
+                self._persist_database_state()
+            return response
         except ApiError as exc:
+            if mutating_method:
+                self._persist_database_state()
             return self._error_response(
                 request_id=request_id,
                 status_code=exc.status_code,
@@ -678,6 +828,8 @@ class DevApiState:
                 retryable=exc.retryable,
             )
         except Exception as exc:
+            if mutating_method:
+                self._persist_database_state()
             return self._error_response(
                 request_id=request_id,
                 status_code=500,
@@ -690,6 +842,7 @@ class DevApiState:
 
     # ----- Core endpoints -----
     def handle_root(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `root` API endpoint."""
         return self._json_response(
             200,
             {
@@ -702,6 +855,7 @@ class DevApiState:
         )
 
     def handle_health(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `health` API endpoint."""
         return self._json_response(
             200,
             {
@@ -714,9 +868,11 @@ class DevApiState:
         )
 
     def handle_capabilities(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `capabilities` API endpoint."""
         return self._json_response(200, self.capabilities)
 
     def handle_server_stats(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `server_stats` API endpoint."""
         window_s = max(1, min(3600, _safe_int(_query_first(ctx.query, "window_s", "60"), 60)))
         cutoff = time.monotonic() - float(window_s)
         durations = [d for ts, d in self._request_metrics if ts >= cutoff]
@@ -752,6 +908,7 @@ class DevApiState:
 
     # ----- Auth / identity -----
     def handle_auth_login(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `auth_login` API endpoint."""
         body = ctx.json(required=True)
         method = str(body.get("method", "")).strip().lower()
         with self._lock:
@@ -782,6 +939,7 @@ class DevApiState:
         raise ApiError(400, "invalid_method", "Unsupported login method.")
 
     def handle_auth_refresh(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `auth_refresh` API endpoint."""
         body = ctx.json(required=True)
         refresh_token = str(body.get("refresh_token", "")).strip()
         if not refresh_token:
@@ -801,6 +959,7 @@ class DevApiState:
             return self._json_response(200, self._issue_tokens(user_id))
 
     def handle_auth_logout(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `auth_logout` API endpoint."""
         body = ctx.json(required=True)
         refresh_token = str(body.get("refresh_token", "")).strip()
         with self._lock:
@@ -809,17 +968,20 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_me(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `me` API endpoint."""
         if ctx.user is None:
             raise ApiError(401, "unauthorized", "Unauthorized.")
         return self._json_response(200, {"user": ctx.user})
 
     # ----- Providers -----
     def handle_providers_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `providers_list` API endpoint."""
         providers = self._provider_catalog()
         items, next_cursor = self._paginate_items(providers, ctx.query)
         return self._json_response(200, {"items": items, "next_cursor": next_cursor})
 
     def handle_providers_scan(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `providers_scan` API endpoint."""
         body = ctx.json(required=False)
         include = body.get("include")
         discovered = [item["id"] for item in self._provider_catalog()]
@@ -836,6 +998,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True, "discovered": discovered, "warnings": warnings})
 
     def handle_provider_models(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `provider_models` API endpoint."""
         provider_id = str(ctx.path_params["provider_id"])
         all_models: List[str] = []
         try:
@@ -858,6 +1021,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_provider_test(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `provider_test` API endpoint."""
         _ = ctx.json(required=False)
         latency = random.randint(20, 200)
         provider_id = str(ctx.path_params["provider_id"])
@@ -865,9 +1029,11 @@ class DevApiState:
 
     # ----- Settings -----
     def handle_settings_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `settings_get` API endpoint."""
         return self._json_response(200, {"settings": self.settings})
 
     def _collect_settings_changes(self, current: Any, updates: Any, prefix: str = "") -> List[Dict[str, Any]]:
+        """Collect settings changes."""
         changes: List[Dict[str, Any]] = []
         if not isinstance(current, dict) or not isinstance(updates, dict):
             if current != updates:
@@ -883,6 +1049,7 @@ class DevApiState:
         return changes
 
     def _deep_merge(self, current: Dict[str, Any], updates: Dict[str, Any]) -> Dict[str, Any]:
+        """Apply merge."""
         merged = dict(current)
         for key, value in updates.items():
             if isinstance(value, dict) and isinstance(merged.get(key), dict):
@@ -892,6 +1059,7 @@ class DevApiState:
         return merged
 
     def handle_settings_put(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `settings_put` API endpoint."""
         body = ctx.json(required=True)
         actor = (ctx.user or {}).get("id", "unknown")
         with self._lock:
@@ -910,11 +1078,13 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_settings_audit(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `settings_audit` API endpoint."""
         items, next_cursor = self._paginate_items(list(self.settings_audit_events), ctx.query)
         return self._json_response(200, {"items": items, "next_cursor": next_cursor})
 
     # ----- Projects -----
     def handle_projects_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `projects_list` API endpoint."""
         q = (_query_first(ctx.query, "q", "") or "").strip().lower()
         status = (_query_first(ctx.query, "status", "") or "").strip().lower()
         environment = (_query_first(ctx.query, "environment", "") or "").strip().lower()
@@ -932,6 +1102,7 @@ class DevApiState:
         return self._json_response(200, {"items": items, "next_cursor": next_cursor})
 
     def handle_projects_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `projects_create` API endpoint."""
         body = ctx.json(required=True)
         name = str(body.get("name", "")).strip()
         if not name:
@@ -965,10 +1136,12 @@ class DevApiState:
         return self._json_response(200, {"project": project})
 
     def handle_projects_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `projects_get` API endpoint."""
         project = self._ensure_project(str(ctx.path_params["project_id"]))
         return self._json_response(200, {"project": project})
 
     def handle_projects_patch(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `projects_patch` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         project = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -981,6 +1154,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_projects_delete(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `projects_delete` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         with self._lock:
@@ -997,6 +1171,7 @@ class DevApiState:
 
     # ----- Sessions / messages -----
     def handle_project_sessions_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_sessions_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         ids = list(self.project_sessions.get(project_id, []))
@@ -1014,6 +1189,7 @@ class DevApiState:
         return self._json_response(200, {"items": items, "next_cursor": next_cursor})
 
     def handle_project_sessions_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_sessions_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         project = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -1050,10 +1226,12 @@ class DevApiState:
         return self._json_response(200, {"session": session})
 
     def handle_sessions_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `sessions_get` API endpoint."""
         session = self._ensure_session(str(ctx.path_params["session_id"]))
         return self._json_response(200, {"session": session})
 
     def handle_sessions_patch(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `sessions_patch` API endpoint."""
         session_id = str(ctx.path_params["session_id"])
         session = self._ensure_session(session_id)
         body = ctx.json(required=True)
@@ -1066,6 +1244,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_session_messages_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `session_messages_list` API endpoint."""
         session_id = str(ctx.path_params["session_id"])
         _ = self._ensure_session(session_id)
         after_ts = _coerce_iso(_query_first(ctx.query, "after_ts", "") or "")
@@ -1084,6 +1263,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_session_messages_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `session_messages_create` API endpoint."""
         session_id = str(ctx.path_params["session_id"])
         _ = self._ensure_session(session_id)
         body = ctx.json(required=True)
@@ -1108,6 +1288,7 @@ class DevApiState:
         return self._json_response(200, {"message_id": message_id})
 
     def _message_to_text(self, message: Dict[str, Any]) -> str:
+        """Transform to text."""
         content = message.get("content")
         if not isinstance(content, list):
             return ""
@@ -1133,19 +1314,23 @@ class DevApiState:
         return "\n".join([p for p in parts if p.strip()]).strip()
 
     def _append_run_event(self, run_id: str, event: Dict[str, Any]) -> None:
+        """Append run event."""
         self.run_events.setdefault(run_id, []).append(event)
 
     def _execute_run_worker(self, run_id: str) -> None:
+        """Execute run worker."""
         with self._lock:
             run = self.runs.get(run_id)
             if run is None:
                 return
             if run.get("status") == "canceled":
                 return
+            # Transition the queued run to running before invoking the model manager.
             run["status"] = "running"
             run["progress"] = 0.05
             run["started_at"] = _utc_now_iso()
             self._append_run_event(run_id, {"type": "status", "ts": _utc_now_iso(), "status": "running", "progress": 0.05})
+        self._persist_database_state()
         try:
             session_id = str(run.get("session_id", ""))
             session = self._ensure_session(session_id)
@@ -1202,6 +1387,7 @@ class DevApiState:
                     {"type": "status", "ts": _utc_now_iso(), "status": "completed", "progress": 1.0},
                 )
                 self._record_audit("system", "run.completed", {"run_id": run_id}, project_id=session.get("project_id"))
+            self._persist_database_state()
         except Exception as exc:
             with self._lock:
                 run_latest = self.runs.get(run_id)
@@ -1224,8 +1410,10 @@ class DevApiState:
                     run_id,
                     {"type": "status", "ts": _utc_now_iso(), "status": "failed", "progress": 1.0},
                 )
+            self._persist_database_state()
 
     def handle_session_runs_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `session_runs_create` API endpoint."""
         session_id = str(ctx.path_params["session_id"])
         session = self._ensure_session(session_id)
         body = ctx.json(required=True)
@@ -1265,12 +1453,14 @@ class DevApiState:
         return self._json_response(200, {"run_id": run_id})
 
     def handle_runs_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `runs_get` API endpoint."""
         run = self._ensure_run(str(ctx.path_params["run_id"]))
         run_copy = dict(run)
         run_copy.pop("_request", None)
         return self._json_response(200, {"run": run_copy})
 
     def handle_runs_cancel(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `runs_cancel` API endpoint."""
         run_id = str(ctx.path_params["run_id"])
         run = self._ensure_run(run_id)
         with self._lock:
@@ -1282,6 +1472,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_runs_events(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `runs_events` API endpoint."""
         run_id = str(ctx.path_params["run_id"])
         _ = self._ensure_run(run_id)
         events = list(self.run_events.get(run_id, []))
@@ -1290,6 +1481,7 @@ class DevApiState:
 
     # ----- Tools -----
     def handle_tools_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `tools_list` API endpoint."""
         scope_filter = (_query_first(ctx.query, "scope", "") or "").strip().lower()
         q = (_query_first(ctx.query, "q", "") or "").strip().lower()
         items: List[Dict[str, Any]] = []
@@ -1326,6 +1518,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_tools_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `tools_create` API endpoint."""
         body = ctx.json(required=True)
         for required_key in ("name", "scope", "description", "schema", "handler"):
             if required_key not in body:
@@ -1344,6 +1537,7 @@ class DevApiState:
         return self._json_response(200, {"tool_id": tool_id})
 
     def handle_tools_delete(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `tools_delete` API endpoint."""
         tool_id = str(ctx.path_params["tool_id"])
         if tool_id in self.dynamic_tools:
             self.dynamic_tools.pop(tool_id, None)
@@ -1351,6 +1545,7 @@ class DevApiState:
         raise ApiError(404, "tool_not_found", f"Dynamic tool not found: {tool_id}")
 
     def _invoke_dynamic_tool(self, tool: Dict[str, Any], args: Dict[str, Any]) -> Tuple[bool, Any]:
+        """Execute a dynamic tool handler using Python or HTTP."""
         handler = dict(tool.get("handler", {}) or {})
         handler_type = str(handler.get("type", "")).strip().lower()
         if handler_type == "python":
@@ -1383,6 +1578,7 @@ class DevApiState:
         return False, {"error": f"Unsupported handler type: {handler_type}"}
 
     def handle_tools_invoke(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `tools_invoke` API endpoint."""
         tool_id = str(ctx.path_params["tool_id"])
         body = ctx.json(required=True)
         args = body.get("args")
@@ -1404,6 +1600,7 @@ class DevApiState:
 
     # ----- Files -----
     def handle_files_tree(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_tree` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         root_param = _query_first(ctx.query, "root", "/") or "/"
         depth = max(1, min(20, _safe_int(_query_first(ctx.query, "depth", "4"), 4)))
@@ -1440,6 +1637,7 @@ class DevApiState:
         return self._json_response(200, {"root": root_param, "items": items})
 
     def handle_files_get_content(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_get_content` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         rel_path = _query_first(ctx.query, "path", "")
         if not rel_path:
@@ -1451,6 +1649,7 @@ class DevApiState:
         return self._json_response(200, {"path": str(rel_path), "encoding": "utf-8", "text": text, "etag": _sha256_text(text)})
 
     def handle_files_put_content(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_put_content` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=True)
         rel_path = str(body.get("path", "")).strip()
@@ -1470,6 +1669,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True, "etag": _sha256_text(text)})
 
     def handle_files_batch(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_batch` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=False)
         reads = body.get("reads")
@@ -1518,6 +1718,7 @@ class DevApiState:
         return self._json_response(200, {"reads": read_results, "writes": write_results})
 
     def handle_files_lint(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_lint` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=True)
         paths = body.get("paths")
@@ -1534,10 +1735,12 @@ class DevApiState:
         return self._json_response(200, {"diagnostics": diagnostics})
 
     def handle_files_format(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_format` API endpoint."""
         _ = ctx.json(required=True)
         return self._json_response(200, {"ok": True})
 
     def handle_files_search(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_search` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=True)
         query_text = str(body.get("q", "")).strip()
@@ -1578,6 +1781,7 @@ class DevApiState:
 
     # ----- Diffs -----
     def _parse_diff_stats(self, patch: str) -> Tuple[int, int]:
+        """Parse diff stats data from the provided input."""
         added = 0
         removed = 0
         for line in patch.splitlines():
@@ -1590,6 +1794,7 @@ class DevApiState:
         return added, removed
 
     def _parse_diff_files(self, patch: str) -> List[Dict[str, Any]]:
+        """Parse diff files data from the provided input."""
         files: Dict[str, Dict[str, Any]] = {}
         current_path = ""
         current_lines: List[str] = []
@@ -1620,6 +1825,7 @@ class DevApiState:
         return list(files.values())
 
     def handle_project_diffs_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_diffs_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         status_filter = (_query_first(ctx.query, "status", "") or "").strip().lower()
@@ -1636,6 +1842,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_project_diffs_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_diffs_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -1664,6 +1871,7 @@ class DevApiState:
         return self._json_response(200, {"diff_id": diff_id})
 
     def handle_diffs_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `diffs_get` API endpoint."""
         diff_id = str(ctx.path_params["diff_id"])
         diff = self.diffs.get(diff_id)
         if diff is None:
@@ -1674,6 +1882,7 @@ class DevApiState:
         return self._json_response(200, {"diff": payload})
 
     def handle_diffs_apply(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `diffs_apply` API endpoint."""
         diff_id = str(ctx.path_params["diff_id"])
         diff = self.diffs.get(diff_id)
         if diff is None:
@@ -1714,6 +1923,7 @@ class DevApiState:
         return self._json_response(200, {"ok": ok, "commit": commit_hash})
 
     def handle_diffs_discard(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `diffs_discard` API endpoint."""
         diff_id = str(ctx.path_params["diff_id"])
         diff = self.diffs.get(diff_id)
         if diff is None:
@@ -1722,6 +1932,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_diffs_comment(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `diffs_comment` API endpoint."""
         diff_id = str(ctx.path_params["diff_id"])
         diff = self.diffs.get(diff_id)
         if diff is None:
@@ -1742,6 +1953,7 @@ class DevApiState:
 
     # ----- Repo -----
     def _run_repo_cmd(self, project_id: str, args: List[str], *, input_text: Optional[str] = None) -> subprocess.CompletedProcess[str]:
+        """Run repo cmd and return its result."""
         root = self._ensure_project_path(project_id)
         return subprocess.run(
             ["git", "-C", str(root), *args],
@@ -1752,6 +1964,7 @@ class DevApiState:
         )
 
     def handle_repo_status(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `repo_status` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         proc = self._run_repo_cmd(project_id, ["status", "--porcelain=1", "-b"])
         if proc.returncode != 0:
@@ -1789,6 +2002,7 @@ class DevApiState:
         return self._json_response(200, {"branch": branch, "dirty": bool(changes), "ahead": ahead, "behind": behind, "changes": changes})
 
     def handle_repo_checkout(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `repo_checkout` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=True)
         branch = str(body.get("branch", "")).strip()
@@ -1800,6 +2014,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_repo_pull(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `repo_pull` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         proc = self._run_repo_cmd(project_id, ["pull", "--ff-only"])
         if proc.returncode != 0:
@@ -1807,6 +2022,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_repo_commit(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `repo_commit` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         body = ctx.json(required=True)
         message = str(body.get("message", "")).strip()
@@ -1829,6 +2045,7 @@ class DevApiState:
 
     # ----- Terminal -----
     def _terminal_shell_cmd(self, shell_name: str) -> List[str]:
+        """Return terminal shell cmd."""
         mapping = {
             "bash": ["bash"],
             "pwsh": ["pwsh", "-NoLogo"],
@@ -1841,6 +2058,7 @@ class DevApiState:
         return cmd
 
     def handle_terminal_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `terminal_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         project_root = self._ensure_project_path(project_id)
         body = ctx.json(required=True)
@@ -1871,6 +2089,7 @@ class DevApiState:
         return self._json_response(200, {"terminal_id": terminal_id})
 
     def handle_terminal_kill(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `terminal_kill` API endpoint."""
         terminal_id = str(ctx.path_params["terminal_id"])
         proc = self._terminal_processes.get(terminal_id)
         if proc is not None:
@@ -1887,6 +2106,7 @@ class DevApiState:
 
     # ----- Deployments -----
     def _deployment_worker(self, deployment_id: str) -> None:
+        """Process the worker."""
         step_names = ["prepare", "build", "deploy", "verify"]
         for idx, name in enumerate(step_names, start=1):
             with self._lock:
@@ -1900,6 +2120,7 @@ class DevApiState:
                 deployment["progress"] = round((idx - 1) / len(step_names), 4)
                 deployment["steps"].append({"id": self._new_id("dstep"), "name": name, "status": "running", "ts": _utc_now_iso()})
                 self.deployment_logs.setdefault(deployment_id, []).append({"ts": _utc_now_iso(), "level": "info", "text": f"Step started: {name}"})
+            self._persist_database_state()
             time.sleep(0.05)
             with self._lock:
                 deployment = self.deployments.get(deployment_id)
@@ -1908,6 +2129,7 @@ class DevApiState:
                 if deployment["steps"]:
                     deployment["steps"][-1]["status"] = "done"
                 deployment["progress"] = round(idx / len(step_names), 4)
+            self._persist_database_state()
         with self._lock:
             deployment = self.deployments.get(deployment_id)
             if deployment is None:
@@ -1917,8 +2139,10 @@ class DevApiState:
                 deployment["ended_at"] = _utc_now_iso()
                 deployment["progress"] = 1.0
                 self.deployment_logs.setdefault(deployment_id, []).append({"ts": _utc_now_iso(), "level": "info", "text": "Deployment succeeded"})
+        self._persist_database_state()
 
     def handle_project_deployments_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_deployments_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         env_filter = (_query_first(ctx.query, "env", "") or "").strip().lower()
@@ -1937,6 +2161,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_project_deployments_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_deployments_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -1967,6 +2192,7 @@ class DevApiState:
         return self._json_response(200, {"deployment_id": deployment_id})
 
     def handle_deployments_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `deployments_get` API endpoint."""
         deployment_id = str(ctx.path_params["deployment_id"])
         deployment = self.deployments.get(deployment_id)
         if deployment is None:
@@ -1974,6 +2200,7 @@ class DevApiState:
         return self._json_response(200, {"deployment": deployment})
 
     def handle_deployments_logs(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `deployments_logs` API endpoint."""
         deployment_id = str(ctx.path_params["deployment_id"])
         _ = self.deployments.get(deployment_id)
         if deployment_id not in self.deployment_logs:
@@ -1982,6 +2209,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_deployments_cancel(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `deployments_cancel` API endpoint."""
         deployment_id = str(ctx.path_params["deployment_id"])
         deployment = self.deployments.get(deployment_id)
         if deployment is None:
@@ -1994,6 +2222,7 @@ class DevApiState:
 
     # ----- Telemetry -----
     def _ensure_project_streams(self, project_id: str) -> List[Dict[str, Any]]:
+        """Return the requested project streams or raise `ApiError` if missing."""
         streams = self.project_telemetry_streams.get(project_id)
         if streams is not None:
             return streams
@@ -2005,6 +2234,7 @@ class DevApiState:
         return streams
 
     def handle_telemetry_streams_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `telemetry_streams_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         streams = self._ensure_project_streams(project_id)
@@ -2012,6 +2242,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_telemetry_query(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `telemetry_query` API endpoint."""
         body = ctx.json(required=True)
         stream_id = str(body.get("stream_id", "")).strip()
         time_range = body.get("time_range")
@@ -2046,6 +2277,7 @@ class DevApiState:
         return self._json_response(200, {"series": series, "anomalies": anomalies})
 
     def handle_telemetry_alerts_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `telemetry_alerts_create` API endpoint."""
         body = ctx.json(required=True)
         for key in ("name", "stream_id", "condition", "actions"):
             if key not in body:
@@ -2057,6 +2289,7 @@ class DevApiState:
 
     # ----- Workflows -----
     def handle_project_workflows_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_workflows_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         workflows = [self.workflows[w_id] for w_id in self.project_workflows.get(project_id, []) if w_id in self.workflows]
@@ -2064,6 +2297,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_project_workflows_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_workflows_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -2087,6 +2321,7 @@ class DevApiState:
         return self._json_response(200, {"workflow_id": workflow_id})
 
     def handle_workflows_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `workflows_get` API endpoint."""
         workflow_id = str(ctx.path_params["workflow_id"])
         workflow = self.workflows.get(workflow_id)
         if workflow is None:
@@ -2094,6 +2329,7 @@ class DevApiState:
         return self._json_response(200, {"workflow": workflow})
 
     def handle_workflows_put(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `workflows_put` API endpoint."""
         workflow_id = str(ctx.path_params["workflow_id"])
         workflow = self.workflows.get(workflow_id)
         if workflow is None:
@@ -2107,6 +2343,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_workflows_run(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `workflows_run` API endpoint."""
         workflow_id = str(ctx.path_params["workflow_id"])
         workflow = self.workflows.get(workflow_id)
         if workflow is None:
@@ -2132,6 +2369,7 @@ class DevApiState:
 
     # ----- Artifacts / uploads -----
     def handle_project_artifacts_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_artifacts_list` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         type_filter = (_query_first(ctx.query, "type", "") or "").strip().lower()
@@ -2147,6 +2385,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_project_artifacts_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `project_artifacts_create` API endpoint."""
         project_id = str(ctx.path_params["project_id"])
         _ = self._ensure_project(project_id)
         body = ctx.json(required=True)
@@ -2195,6 +2434,7 @@ class DevApiState:
         return self._json_response(200, {"artifact_id": artifact_id, "download_url": artifact["download_url"]})
 
     def handle_artifacts_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `artifacts_get` API endpoint."""
         artifact_id = str(ctx.path_params["artifact_id"])
         artifact = self.artifacts.get(artifact_id)
         if artifact is None:
@@ -2204,6 +2444,7 @@ class DevApiState:
         return self._json_response(200, {"artifact": payload})
 
     def handle_uploads_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `uploads_create` API endpoint."""
         body = ctx.json(required=True)
         for key in ("filename", "content_type", "size_bytes"):
             if key not in body:
@@ -2239,6 +2480,7 @@ class DevApiState:
         )
 
     def handle_uploads_write(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `uploads_write` API endpoint."""
         upload_id = str(ctx.path_params["upload_id"])
         upload = self.uploads.get(upload_id)
         if upload is None:
@@ -2256,6 +2498,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_files_meta_get(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `files_meta_get` API endpoint."""
         file_id = str(ctx.path_params["file_id"])
         meta = self.file_meta.get(file_id)
         if meta is None:
@@ -2264,12 +2507,14 @@ class DevApiState:
 
     # ----- Notifications / audit / admin -----
     def handle_notifications_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `notifications_list` API endpoint."""
         items = list(self.notifications.values())
         items.sort(key=lambda x: str(x.get("ts", "")), reverse=True)
         page, next_cursor = self._paginate_items(items, ctx.query)
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_notifications_ack(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `notifications_ack` API endpoint."""
         body = ctx.json(required=True)
         ids = body.get("ids")
         if not isinstance(ids, list):
@@ -2281,6 +2526,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_audit_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `audit_list` API endpoint."""
         project_id = (_query_first(ctx.query, "project_id", "") or "").strip()
         event_type = (_query_first(ctx.query, "type", "") or "").strip()
         events = list(self.audit_events)
@@ -2295,6 +2541,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_admin_users_list(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `admin_users_list` API endpoint."""
         q = (_query_first(ctx.query, "q", "") or "").strip().lower()
         users = [self._sanitize_user(u) for u in self.users.values() if not u.get("disabled", False)]
         if q:
@@ -2303,6 +2550,7 @@ class DevApiState:
         return self._json_response(200, {"items": page, "next_cursor": next_cursor})
 
     def handle_admin_users_create(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `admin_users_create` API endpoint."""
         body = ctx.json(required=True)
         for key in ("name", "email", "roles"):
             if key not in body:
@@ -2321,6 +2569,7 @@ class DevApiState:
         return self._json_response(200, {"user": self._sanitize_user(user)})
 
     def handle_admin_users_patch(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `admin_users_patch` API endpoint."""
         user_id = str(ctx.path_params["user_id"])
         user = self.users.get(user_id)
         if user is None:
@@ -2337,6 +2586,7 @@ class DevApiState:
         return self._json_response(200, {"ok": True})
 
     def handle_admin_users_delete(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `admin_users_delete` API endpoint."""
         user_id = str(ctx.path_params["user_id"])
         if user_id in self.users:
             self.users.pop(user_id, None)
@@ -2346,6 +2596,7 @@ class DevApiState:
 
     # ----- Streaming -----
     def handle_stream_session(self, ctx: RequestContext) -> ApiResponse:
+        """Handle the `stream_session` API endpoint."""
         session_id = str(ctx.path_params["session_id"])
         _ = self._ensure_session(session_id)
         run_id = (_query_first(ctx.query, "run_id", "") or "").strip()
@@ -2360,6 +2611,7 @@ class DevApiState:
         if from_cursor > 0:
             events = events[from_cursor:]
         chunks: List[str] = []
+        # Keep idle SSE connections alive even when no events are available.
         if not events:
             chunks.append(": keep-alive\n\n")
         for idx, event in enumerate(events, start=from_cursor):
@@ -2381,10 +2633,12 @@ class DevApiState:
 
 
 class _ApiRequestHandler(BaseHTTPRequestHandler):
+    """Bridge HTTP requests into `DevApiState` dispatch calls."""
     server_version = "G4FAgentDevApi/1.0"
     protocol_version = "HTTP/1.1"
 
     def _read_body(self) -> bytes:
+        """Read the full HTTP request body based on the Content-Length header."""
         length = _safe_int(self.headers.get("Content-Length", "0"), 0)
         if length <= 0:
             return b""
@@ -2392,9 +2646,11 @@ class _ApiRequestHandler(BaseHTTPRequestHandler):
 
     @property
     def state(self) -> DevApiState:
+        """Return the shared API state for this HTTP server instance."""
         return self.server.state  # type: ignore[attr-defined]
 
     def _handle(self, method: str) -> None:
+        """Dispatch a specific HTTP method to the API state handler."""
         response = self.state.dispatch(
             method=method.upper(),
             raw_path=self.path,
@@ -2404,6 +2660,7 @@ class _ApiRequestHandler(BaseHTTPRequestHandler):
         self._write_response(response)
 
     def _write_response(self, response: ApiResponse) -> None:
+        """Serialize and write an `ApiResponse` to the client socket."""
         self.send_response(response.status_code)
         body_bytes: bytes
         if isinstance(response.body, (bytes, bytearray)):
@@ -2424,6 +2681,7 @@ class _ApiRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(body_bytes)
 
     def do_OPTIONS(self) -> None:  # noqa: N802
+        """Handle HTTP OPTIONS requests."""
         self.send_response(204)
         self.send_header("Access-Control-Allow-Origin", "*")
         self.send_header("Access-Control-Allow-Headers", "Authorization, Content-Type")
@@ -2432,28 +2690,36 @@ class _ApiRequestHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     def do_GET(self) -> None:  # noqa: N802
+        """Handle HTTP GET requests."""
         self._handle("GET")
 
     def do_POST(self) -> None:  # noqa: N802
+        """Handle HTTP POST requests."""
         self._handle("POST")
 
     def do_PUT(self) -> None:  # noqa: N802
+        """Handle HTTP PUT requests."""
         self._handle("PUT")
 
     def do_PATCH(self) -> None:  # noqa: N802
+        """Handle HTTP PATCH requests."""
         self._handle("PATCH")
 
     def do_DELETE(self) -> None:  # noqa: N802
+        """Handle HTTP DELETE requests."""
         self._handle("DELETE")
 
     def log_message(self, format: str, *args: Any) -> None:
+        """Suppress default HTTP server log output."""
         _ = format
         _ = args
         return
 
 
 class DevApiHttpServer(ThreadingHTTPServer):
+    """Threaded HTTP server that exposes a shared `DevApiState` instance."""
     def __init__(self, server_address: Tuple[str, int], state: DevApiState):
+        """Initialize a `DevApiHttpServer` instance."""
         self.state = state
         super().__init__(server_address, _ApiRequestHandler)
 
@@ -2469,15 +2735,26 @@ def create_api_server(
     tools_dirs: Optional[Iterable[str]] = None,
     auth_disabled: bool = False,
     api_key: str = "dev-api-key",
+    database: Optional[Union[str, Database]] = None,
 ) -> DevApiHttpServer:
-    manager = G4FManager.from_config(config_rel_path=config_rel_path, base_dir=config_base_dir)
+    """Create and configure a development API HTTP server instance."""
+    resolved_workspace_dir = (workspace_dir or (Path.cwd() / ".g4fagent_api")).resolve()
+    resolved_workspace_dir.mkdir(parents=True, exist_ok=True)
+    resolved_database = create_database(database, base_dir=resolved_workspace_dir)
+    manager = G4FManager.from_config(
+        config_rel_path=config_rel_path,
+        base_dir=config_base_dir,
+        database=resolved_database,
+        database_base_dir=resolved_workspace_dir,
+    )
     state = DevApiState(
         base_path=base_path,
-        workspace_dir=workspace_dir or (Path.cwd() / ".g4fagent_api"),
+        workspace_dir=resolved_workspace_dir,
         manager=manager,
         tools_dirs=tools_dirs,
         auth_disabled=auth_disabled,
         api_key=api_key,
+        database=resolved_database,
     )
     return DevApiHttpServer((host, int(port)), state)
 
@@ -2493,7 +2770,9 @@ def run_api_server(
     tools_dirs: Optional[Iterable[str]] = None,
     auth_disabled: bool = False,
     api_key: str = "dev-api-key",
+    database: Optional[Union[str, Database]] = None,
 ) -> int:
+    """Run the development API server until interrupted."""
     server = create_api_server(
         host=host,
         port=port,
@@ -2504,6 +2783,7 @@ def run_api_server(
         tools_dirs=tools_dirs,
         auth_disabled=auth_disabled,
         api_key=api_key,
+        database=database,
     )
     bound_host, bound_port = server.server_address[:2]
     print(f"G4FAgent API server listening on http://{bound_host}:{bound_port}{server.state.base_path}")

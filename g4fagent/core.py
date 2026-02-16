@@ -19,10 +19,11 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 from .config import load_runtime_config, resolve_pipeline_stages
 from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH, G4F_SUPPORTED_CHAT_PARAMS
+from .database import Database, create_database
 from .utils import (
     clamp,
     deep_merge_dict,
@@ -835,6 +836,71 @@ class Project:
     chat_history: List[Dict[str, Any]] = field(default_factory=list)
     state: Dict[str, Any] = field(default_factory=dict)
     files: List[ProjectFile] = field(default_factory=list)
+    database: Optional[Database] = field(default=None, repr=False, compare=False)
+    database_bucket: str = field(default="project", repr=False, compare=False)
+    database_key: str = field(default="state", repr=False, compare=False)
+    _suspend_persist: bool = field(default=False, init=False, repr=False, compare=False)
+
+    def __post_init__(self) -> None:
+        self._hydrate_from_database()
+
+    def attach_database(
+        self,
+        database: Optional[Database],
+        *,
+        bucket: str = "project",
+        key: str = "state",
+    ) -> None:
+        """Attach/replace a backing database for this project instance."""
+        self.database = database
+        self.database_bucket = str(bucket)
+        self.database_key = str(key)
+        self._hydrate_from_database()
+
+    def _load_from_dict(self, snapshot: Dict[str, Any]) -> None:
+        self._suspend_persist = True
+        try:
+            self.name = str(snapshot.get("name") or self.name)
+            accepted_data = snapshot.get("accepted_data")
+            self.accepted_data = deepcopy(accepted_data) if isinstance(accepted_data, dict) else {}
+            chat_history = snapshot.get("chat_history")
+            self.chat_history = deepcopy(chat_history) if isinstance(chat_history, list) else []
+            state = snapshot.get("state")
+            self.state = deepcopy(state) if isinstance(state, dict) else {}
+            loaded_files: List[ProjectFile] = []
+            for raw in snapshot.get("files", []) if isinstance(snapshot.get("files"), list) else []:
+                if not isinstance(raw, dict):
+                    continue
+                path_value = raw.get("path")
+                if not isinstance(path_value, str) or not path_value:
+                    continue
+                loaded_files.append(
+                    ProjectFile(
+                        path=str(path_value),
+                        spec=str(raw.get("spec", "") or ""),
+                        content=raw.get("content"),
+                        accepted=bool(raw.get("accepted", False)),
+                        status=str(raw.get("status", "pending") or "pending"),
+                        notes=str(raw.get("notes", "") or ""),
+                    )
+                )
+            self.files = loaded_files
+        finally:
+            self._suspend_persist = False
+
+    def _hydrate_from_database(self) -> None:
+        if self.database is None:
+            return
+        snapshot = self.database.get(self.database_bucket, self.database_key, default=None)
+        if isinstance(snapshot, dict):
+            self._load_from_dict(snapshot)
+            return
+        self._persist_to_database()
+
+    def _persist_to_database(self) -> None:
+        if self.database is None or self._suspend_persist:
+            return
+        self.database.set(self.database_bucket, self.database_key, self.to_dict())
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize project state into a plain dictionary.
@@ -869,6 +935,7 @@ class Project:
         ```
         """
         self.state[str(key)] = deepcopy(value)
+        self._persist_to_database()
 
     def update_state(self, updates: Dict[str, Any]) -> None:
         """Merge multiple keys into current project state.
@@ -886,6 +953,7 @@ class Project:
             return
         for k, v in updates.items():
             self.state[str(k)] = deepcopy(v)
+        self._persist_to_database()
 
     def accept(self, key: str, value: Any) -> None:
         """Store accepted data under a top-level key.
@@ -900,6 +968,7 @@ class Project:
         ```
         """
         self.accepted_data[str(key)] = deepcopy(value)
+        self._persist_to_database()
 
     def append_accepted(self, key: str, value: Any) -> None:
         """Append a value into an accepted-data list bucket.
@@ -921,6 +990,7 @@ class Project:
         if not isinstance(current, list):
             raise TypeError(f"Accepted data key '{bucket_key}' is not a list")
         current.append(deepcopy(value))
+        self._persist_to_database()
 
     def set_accepted_entry(self, key: str, entry_key: str, value: Any) -> None:
         """Set a keyed entry in a map-style accepted-data bucket.
@@ -942,6 +1012,7 @@ class Project:
         if not isinstance(current, dict):
             raise TypeError(f"Accepted data key '{bucket_key}' is not a dictionary")
         current[str(entry_key)] = deepcopy(value)
+        self._persist_to_database()
 
     def get_file(self, path: str) -> Optional[ProjectFile]:
         """Return a tracked file by path, if present.
@@ -996,6 +1067,7 @@ class Project:
             f.status = str(status)
         if notes is not None:
             f.notes = str(notes)
+        self._persist_to_database()
         return f
 
     def record_chat(
@@ -1037,6 +1109,7 @@ class Project:
         if attempt is not None:
             entry["attempt"] = int(attempt)
         self.chat_history.append(entry)
+        self._persist_to_database()
 
 
 @dataclass
@@ -1575,6 +1648,7 @@ class G4FManager:
         runtime_cfg: Dict[str, Any],
         cfg: Optional[LLMConfig] = None,
         project: Optional[Project] = None,
+        database: Optional[Database] = None,
     ):
         """Initialize the manager from resolved runtime configuration.
         
@@ -1587,19 +1661,28 @@ class G4FManager:
         value = instance.__init__(...)
         ```
         """
+        self.database = database
         self.runtime_cfg = runtime_cfg
-        default_retries = int((runtime_cfg.get("g4f_defaults", {}) or {}).get("max_retries", 2))
+        if self.database is not None:
+            persisted_runtime_cfg = self.database.get("manager", "runtime_cfg", default=None)
+            if isinstance(persisted_runtime_cfg, dict):
+                self.runtime_cfg = persisted_runtime_cfg
+            else:
+                self.database.set("manager", "runtime_cfg", deepcopy(runtime_cfg))
+        default_retries = int((self.runtime_cfg.get("g4f_defaults", {}) or {}).get("max_retries", 2))
         self.cfg = cfg or LLMConfig(max_retries=default_retries)
         self.project = project or Project()
+        if self.database is not None:
+            self.project.attach_database(self.database, bucket="manager", key="project")
 
-        loaded_agents = (runtime_cfg.get("loaded_agents", {}) or {})
+        loaded_agents = (self.runtime_cfg.get("loaded_agents", {}) or {})
         self.agents: List[Agent] = [
             Agent.from_definition(str(role), definition)
             for role, definition in loaded_agents.items()
             if isinstance(definition, dict)
         ]
         self._agents_by_role: Dict[str, Agent] = {agent.role: agent for agent in self.agents}
-        self.pipeline = Pipeline.from_runtime_config(runtime_cfg, self._agents_by_role)
+        self.pipeline = Pipeline.from_runtime_config(self.runtime_cfg, self._agents_by_role)
 
     @classmethod
     def from_runtime_config(
@@ -1607,6 +1690,8 @@ class G4FManager:
         runtime_cfg: Dict[str, Any],
         cfg: Optional[LLMConfig] = None,
         project: Optional[Project] = None,
+        database: Optional[Union[str, Database]] = None,
+        database_base_dir: Optional[Path] = None,
     ) -> "G4FManager":
         """Create a manager from an in-memory runtime config object.
         
@@ -1619,7 +1704,13 @@ class G4FManager:
         result = instance.from_runtime_config(...)
         ```
         """
-        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project)
+        resolved_base_dir = database_base_dir
+        if resolved_base_dir is None:
+            config_path = ((runtime_cfg.get("_meta", {}) or {}).get("config_path"))
+            if isinstance(config_path, str) and config_path.strip():
+                resolved_base_dir = Path(config_path).resolve().parent
+        resolved_db = create_database(database, base_dir=resolved_base_dir or Path.cwd())
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project, database=resolved_db)
 
     @classmethod
     def from_config(
@@ -1628,6 +1719,8 @@ class G4FManager:
         base_dir: Path = APP_ROOT,
         cfg: Optional[LLMConfig] = None,
         project: Optional[Project] = None,
+        database: Optional[Union[str, Database]] = None,
+        database_base_dir: Optional[Path] = None,
     ) -> "G4FManager":
         """Load configuration from disk and build a manager instance.
         
@@ -1641,7 +1734,8 @@ class G4FManager:
         ```
         """
         runtime_cfg = load_runtime_config(base_dir, config_rel_path)
-        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project)
+        resolved_db = create_database(database, base_dir=database_base_dir or base_dir)
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project, database=resolved_db)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize manager state to a dictionary.
@@ -1660,6 +1754,7 @@ class G4FManager:
             "pipeline": self.pipeline.to_dict(),
             "meta": dict((self.runtime_cfg.get("_meta", {}) or {})),
             "project": self.project.to_dict(),
+            "database": self.database.__class__.__name__ if self.database is not None else None,
         }
 
     def get_project(self) -> Project:

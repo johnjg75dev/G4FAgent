@@ -24,8 +24,13 @@ g4fagent --out ./my_project
 g4fagent --out ./my_project --config ./config.json
 g4fagent --out ./my_project --model gpt-4o-mini --temperature 0.2
 g4fagent --out ./my_project --tools-dir ./custom_tools
+g4fagent scan-models
+g4fagent scan-models --provider OpenaiChat --parallel --workers 6
 g4fagent --out ./my_project --lint-cmd "ruff check ." --test-cmd "python -m unittest discover -s tests -p test_offline*.py"
 ```
+
+`scan-models` writes rolling results to the configured database after each model result (`scan_models.last_run`) so partial progress survives abrupt exits.
+While a scan is running: `Ctrl+C` stops, `Ctrl+P` skips the current provider, and `Ctrl+M` skips the current model.
 
 If lint/test commands fail and a `debug` stage is configured, the CLI can auto-run debug rounds that feed stdout/stderr/errors/warnings back to `DebugAgent` for fixes.
 
@@ -70,6 +75,13 @@ from g4fagent.constants import APP_ROOT
 manager = G4FManager.from_config(config_rel_path="config.json", base_dir=APP_ROOT)
 print(manager.list_agents())
 print(manager.list_stages())
+
+# optional persistence backend
+manager_with_db = G4FManager.from_config(
+    config_rel_path="config.json",
+    base_dir=APP_ROOT,
+    database="json",
+)
 ```
 
 ## Scan available models

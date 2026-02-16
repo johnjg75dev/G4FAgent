@@ -16,6 +16,7 @@ import signal
 import subprocess
 import sys
 import textwrap
+import threading
 import time
 import zipfile
 from copy import deepcopy
@@ -23,8 +24,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from g4fagent import (
+    DATABASE_BACKENDS,
     G4FManager,
     Project,
+    create_database,
     list_known_model_names_for_provider,
     list_known_provider_names,
     resolve_provider_name,
@@ -664,6 +667,612 @@ def print_provider_model_list(provider_name: str, models: List[str]) -> None:
     print_hr("-")
 
 
+def resolve_config_location(config_value: str) -> Tuple[Path, str]:
+    config_arg = Path(config_value)
+    if config_value == DEFAULT_CONFIG_REL_PATH:
+        return APP_ROOT, config_value
+    if config_arg.is_absolute():
+        return config_arg.parent, config_arg.name
+    return Path.cwd(), config_value
+
+
+def build_provider_model_scan_specs(
+    *,
+    requested_providers: List[str],
+    requested_models: List[str],
+) -> List[Dict[str, str]]:
+    provider_inputs = [str(x).strip() for x in requested_providers if isinstance(x, str) and str(x).strip()]
+    model_inputs: List[str] = []
+    for value in requested_models:
+        if not isinstance(value, str):
+            continue
+        model_name = value.strip()
+        if not model_name:
+            continue
+        if model_name not in model_inputs:
+            model_inputs.append(model_name)
+
+    if provider_inputs:
+        providers = provider_inputs
+    else:
+        providers = list_known_provider_names(include_meta=False)
+
+    specs: List[Dict[str, str]] = []
+    seen: set[tuple[str, str]] = set()
+    explicit_provider_filter = bool(provider_inputs)
+
+    for provider_name in providers:
+        known_models = list_known_model_names_for_provider(provider_name)
+        if model_inputs:
+            if explicit_provider_filter:
+                selected_models = list(model_inputs)
+            else:
+                selected_models = [m for m in model_inputs if m in set(known_models)]
+        else:
+            selected_models = list(known_models)
+
+        for model_name in selected_models:
+            key = (str(provider_name), str(model_name))
+            if key in seen:
+                continue
+            seen.add(key)
+            specs.append({"model": str(model_name), "provider": str(provider_name)})
+    return specs
+
+
+class ScanSkipController:
+    def __init__(self) -> None:
+        self._lock = threading.RLock()
+        self._current_provider: Optional[str] = None
+        self._current_model: Optional[str] = None
+        self._skip_providers: set[str] = set()
+        self._skip_models: set[Tuple[str, str]] = set()
+        self._discard_current_providers: set[str] = set()
+        self._discard_current_models: set[Tuple[str, str]] = set()
+
+    def set_current(self, provider: str, model: str) -> None:
+        with self._lock:
+            self._current_provider = str(provider)
+            self._current_model = str(model)
+
+    def clear_current(self) -> None:
+        with self._lock:
+            self._current_provider = None
+            self._current_model = None
+
+    def request_skip_provider(self) -> Optional[str]:
+        with self._lock:
+            if not self._current_provider:
+                return None
+            provider = str(self._current_provider)
+            self._skip_providers.add(provider)
+            self._discard_current_providers.add(provider)
+            return provider
+
+    def request_skip_model(self) -> Optional[Tuple[str, str]]:
+        with self._lock:
+            if not self._current_provider or not self._current_model:
+                return None
+            pair = (str(self._current_provider), str(self._current_model))
+            self._skip_models.add(pair)
+            self._discard_current_models.add(pair)
+            return pair
+
+    def should_skip(self, provider: str, model: str) -> bool:
+        key = (str(provider), str(model))
+        with self._lock:
+            return str(provider) in self._skip_providers or key in self._skip_models
+
+    def should_discard_current_result(self, provider: str, model: str) -> bool:
+        key = (str(provider), str(model))
+        with self._lock:
+            discard = False
+            if str(provider) in self._discard_current_providers:
+                self._discard_current_providers.discard(str(provider))
+                discard = True
+            if key in self._discard_current_models:
+                self._discard_current_models.discard(key)
+                discard = True
+            return discard
+
+    def skipped_providers(self) -> List[str]:
+        with self._lock:
+            return sorted(self._skip_providers)
+
+    def skipped_model_pairs(self) -> List[Tuple[str, str]]:
+        with self._lock:
+            return sorted(self._skip_models)
+
+
+def _start_scan_hotkey_listener(
+    *,
+    skip_controller: ScanSkipController,
+    stop_event: threading.Event,
+) -> Callable[[], None]:
+    if os.name == "nt":
+        try:
+            import msvcrt  # type: ignore
+        except Exception:
+            return lambda: None
+
+        def worker() -> None:
+            while not stop_event.is_set():
+                try:
+                    if not msvcrt.kbhit():
+                        time.sleep(0.05)
+                        continue
+                    key = msvcrt.getch()
+                except Exception:
+                    time.sleep(0.05)
+                    continue
+                if key == b"\x10":  # Ctrl+P
+                    provider = skip_controller.request_skip_provider()
+                    if provider:
+                        print(f"\nSkip requested: provider '{provider}' (Ctrl+P)", flush=True)
+                    else:
+                        print("\nSkip provider ignored: no active provider/model.", flush=True)
+                elif key in {b"\r", b"\x0d"}:  # Ctrl+M (same code as Enter)
+                    model_pair = skip_controller.request_skip_model()
+                    if model_pair:
+                        print(
+                            f"\nSkip requested: model '{model_pair[1]}' on provider '{model_pair[0]}' (Ctrl+M)",
+                            flush=True,
+                        )
+                    else:
+                        print("\nSkip model ignored: no active provider/model.", flush=True)
+
+        thread = threading.Thread(target=worker, daemon=True)
+        thread.start()
+
+        def cleanup() -> None:
+            stop_event.set()
+            thread.join(timeout=0.3)
+
+        return cleanup
+
+    try:
+        import select
+        import termios
+        import tty
+    except Exception:
+        return lambda: None
+    if not getattr(sys.stdin, "isatty", lambda: False)():
+        return lambda: None
+
+    try:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        tty.setcbreak(fd)
+    except Exception:
+        return lambda: None
+
+    def worker() -> None:
+        while not stop_event.is_set():
+            try:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+            except Exception:
+                time.sleep(0.05)
+                continue
+            if not ready:
+                continue
+            try:
+                ch = sys.stdin.read(1)
+            except Exception:
+                continue
+            if ch == "\x10":
+                provider = skip_controller.request_skip_provider()
+                if provider:
+                    print(f"\nSkip requested: provider '{provider}' (Ctrl+P)", flush=True)
+                else:
+                    print("\nSkip provider ignored: no active provider/model.", flush=True)
+            elif ch in {"\r", "\n"}:
+                model_pair = skip_controller.request_skip_model()
+                if model_pair:
+                    print(
+                        f"\nSkip requested: model '{model_pair[1]}' on provider '{model_pair[0]}' (Ctrl+M)",
+                        flush=True,
+                    )
+                else:
+                    print("\nSkip model ignored: no active provider/model.", flush=True)
+
+    thread = threading.Thread(target=worker, daemon=True)
+    thread.start()
+
+    def cleanup() -> None:
+        stop_event.set()
+        thread.join(timeout=0.3)
+        try:
+            termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+        except Exception:
+            return
+
+    return cleanup
+
+
+def _build_incremental_scan_report(
+    *,
+    started_at: str,
+    finished_at: str,
+    duration_seconds: float,
+    prompt: str,
+    delay_seconds: float,
+    max_workers: int,
+    parallel: bool,
+    stopped: bool,
+    stop_reason: Optional[str],
+    results: List[Dict[str, Any]],
+    planned_total: int,
+    skipped_providers: List[str],
+    skipped_model_pairs: List[Tuple[str, str]],
+) -> Dict[str, Any]:
+    ordered_results = list(results)
+    working = [r["model"] for r in ordered_results if r.get("ok")]
+    failing = [r["model"] for r in ordered_results if not r.get("ok")]
+    working_provider_models = [str(r.get("provider_model", "")) for r in ordered_results if r.get("ok")]
+    failing_provider_models = [str(r.get("provider_model", "")) for r in ordered_results if not r.get("ok")]
+    no_response = [r for r in ordered_results if str(r.get("status", "")) == "no_response"]
+    errors = [r for r in ordered_results if str(r.get("status", "")) == "error"]
+
+    return {
+        "started_at": started_at,
+        "finished_at": finished_at,
+        "duration_seconds": round(max(0.0, float(duration_seconds)), 4),
+        "prompt": prompt,
+        "provider": None,
+        "delay_seconds": delay_seconds,
+        "parallel": bool(parallel),
+        "max_workers": int(max_workers),
+        "stopped": bool(stopped),
+        "stop_reason": stop_reason,
+        "planned_total": int(planned_total),
+        "skipped_providers": list(skipped_providers),
+        "skipped_provider_models": [f"{p}/{m}" for p, m in skipped_model_pairs],
+        "total": len(ordered_results),
+        "ok_count": len(working),
+        "failed_count": len(failing),
+        "no_response_count": len(no_response),
+        "error_count": len(errors),
+        "working_models": working,
+        "failing_models": failing,
+        "working_provider_models": working_provider_models,
+        "failing_provider_models": failing_provider_models,
+        "results": ordered_results,
+    }
+
+
+def _persist_scan_report(db: Any, run_id: str, report: Dict[str, Any]) -> None:
+    if db is None:
+        return
+    db.set("scan_models", "last_run", report)
+    db.set("scan_models", run_id, report)
+
+
+def run_scan_models_command(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="g4fagent scan-models",
+        description="Scan provider/model combinations and report working pairs.",
+    )
+    ap.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_REL_PATH,
+        help=(
+            "Runtime config JSON path. Default uses packaged assets; "
+            "custom relative paths resolve from current working directory."
+        ),
+    )
+    ap.add_argument(
+        "--database",
+        choices=list(DATABASE_BACKENDS),
+        default=None,
+        help="Optional persistence backend for runtime/project state.",
+    )
+    ap.add_argument(
+        "--provider",
+        "--scan-provider",
+        action="append",
+        default=[],
+        help="Provider name to scan. Repeat to scan multiple providers.",
+    )
+    ap.add_argument(
+        "--model",
+        "--scan-model",
+        action="append",
+        default=[],
+        help="Model alias/name to scan. Repeat to scan multiple specific models.",
+    )
+    ap.add_argument(
+        "--prompt",
+        "--scan-prompt",
+        default="Reply with exactly: OK",
+        help="Probe prompt used for model scanning.",
+    )
+    ap.add_argument(
+        "--timeout",
+        "--scan-timeout",
+        type=float,
+        default=30.0,
+        help="Per-call timeout in seconds for model scans.",
+    )
+    ap.add_argument(
+        "--delay",
+        "--scan-delay",
+        type=float,
+        default=0.0,
+        help="Delay between scan starts in seconds.",
+    )
+    ap.add_argument(
+        "--parallel",
+        "--scan-parallel",
+        action="store_true",
+        help="Request parallel scan mode (currently disabled when interactive skip controls are active).",
+    )
+    ap.add_argument(
+        "--workers",
+        "--scan-workers",
+        type=int,
+        default=4,
+        help="Max workers for parallel model scans.",
+    )
+    ap.add_argument(
+        "--output",
+        "--scan-output",
+        default=None,
+        help="Optional file path to write scan JSON results.",
+    )
+    ap.add_argument("--list-providers", action="store_true", help="List valid g4f provider names and exit.")
+    ap.add_argument(
+        "--list-models-for-provider",
+        default=None,
+        help="List valid model aliases for the specified provider and exit.",
+    )
+    args = ap.parse_args(argv)
+
+    if args.timeout is not None and args.timeout <= 0:
+        print("--timeout must be > 0")
+        return 2
+    if args.workers <= 0:
+        print("--workers must be > 0")
+        return 2
+
+    requested_providers: List[str] = []
+    for raw_provider in args.provider or []:
+        provider_text = str(raw_provider or "").strip()
+        if not provider_text:
+            continue
+        resolved_provider = resolve_provider_name(provider_text)
+        if resolved_provider is None:
+            print(f"Unknown provider: {provider_text}")
+            known = list_known_provider_names(include_meta=False)
+            if known:
+                print(f"Try one of: {', '.join(known[:30])}")
+            return 2
+        if resolved_provider not in requested_providers:
+            requested_providers.append(resolved_provider)
+
+    list_mode_used = False
+    if args.list_providers:
+        providers = list_known_provider_names(include_meta=False)
+        print_provider_list(providers)
+        list_mode_used = True
+
+    if args.list_models_for_provider is not None:
+        requested_provider = str(args.list_models_for_provider).strip()
+        if not requested_provider:
+            print("--list-models-for-provider requires a non-empty provider name.")
+            return 2
+        resolved_provider = resolve_provider_name(requested_provider)
+        if resolved_provider is None:
+            print(f"Unknown provider: {requested_provider}")
+            known = list_known_provider_names(include_meta=False)
+            if known:
+                print(f"Try one of: {', '.join(known[:30])}")
+            return 2
+        provider_models = list_known_model_names_for_provider(resolved_provider)
+        print_provider_model_list(resolved_provider, provider_models)
+        list_mode_used = True
+
+    if list_mode_used:
+        return 0
+
+    requested_models = [str(m).strip() for m in (args.model or []) if isinstance(m, str) and str(m).strip()]
+    scan_specs = build_provider_model_scan_specs(
+        requested_providers=requested_providers,
+        requested_models=requested_models,
+    )
+    if not scan_specs:
+        if requested_providers:
+            print("No provider/model combinations matched your filters.")
+        else:
+            print("No provider/model combinations discovered to scan.")
+        return 2
+
+    config_base_dir, config_rel_path = resolve_config_location(str(args.config))
+    manager = G4FManager.from_config(
+        config_rel_path=config_rel_path,
+        base_dir=config_base_dir,
+        database=args.database,
+        database_base_dir=Path.cwd(),
+    )
+    scan_db = manager.database or create_database("json", base_dir=Path.cwd())
+    run_id = f"scan_{int(time.time() * 1000)}"
+    started_at = now_iso()
+    started_monotonic = time.monotonic()
+    results: List[Dict[str, Any]] = []
+    stop_reason: Optional[str] = None
+    stream_state = {"count": 0, "stop_requested": False}
+    skip_controller = ScanSkipController()
+    hotkey_stop_event = threading.Event()
+    hotkey_cleanup = _start_scan_hotkey_listener(skip_controller=skip_controller, stop_event=hotkey_stop_event)
+    previous_sigint = signal.getsignal(signal.SIGINT)
+    scan_delay_seconds = max(0.0, float(args.delay))
+    effective_parallel = args.parallel
+
+    def build_report_snapshot(*, status: str, stop_reason_value: Optional[str]) -> Dict[str, Any]:
+        snapshot = _build_incremental_scan_report(
+            started_at=started_at,
+            finished_at=now_iso(),
+            duration_seconds=round(max(0.0, time.monotonic() - started_monotonic), 4),
+            prompt=str(args.prompt),
+            delay_seconds=scan_delay_seconds,
+            max_workers=int(args.workers),
+            parallel=effective_parallel,
+            stopped=bool(status != "running"),
+            stop_reason=stop_reason_value,
+            results=results,
+            planned_total=len(scan_specs),
+            skipped_providers=skip_controller.skipped_providers(),
+            skipped_model_pairs=skip_controller.skipped_model_pairs(),
+        )
+        snapshot["run_id"] = run_id
+        snapshot["status"] = status
+        snapshot["filters"] = {
+            "providers": list(requested_providers),
+            "models": list(requested_models),
+        }
+        return snapshot
+
+    def persist_report_snapshot(*, status: str, stop_reason_value: Optional[str]) -> None:
+        snapshot = build_report_snapshot(status=status, stop_reason_value=stop_reason_value)
+        _persist_scan_report(scan_db, run_id, snapshot)
+
+    def request_scan_stop(reason: str) -> None:
+        if stream_state["stop_requested"]:
+            return
+        stream_state["stop_requested"] = True
+        print(f"\nStop requested ({reason}). Finishing current model request and returning partial results...")
+
+    def handle_sigint(_signum: int, _frame: Any) -> None:
+        if stream_state["stop_requested"]:
+            raise KeyboardInterrupt
+        request_scan_stop("Ctrl+C")
+
+    print_hr()
+    print("Scanning models...")
+    print("Controls: Ctrl+C stop scan, Ctrl+P skip current provider, Ctrl+M skip current model.")
+    signal.signal(signal.SIGINT, handle_sigint)
+    persist_report_snapshot(status="running", stop_reason_value=None)
+    try:
+        next_scheduled_start = time.monotonic()
+        for spec in scan_specs:
+            provider_name = str(spec.get("provider", "")).strip()
+            model_name = str(spec.get("model", "")).strip()
+            if not provider_name or not model_name:
+                continue
+            provider_model = provider_model_label(provider_name, model_name)
+
+            if stream_state["stop_requested"]:
+                stop_reason = "stop_requested"
+                break
+
+            if skip_controller.should_skip(provider_name, model_name):
+                print(f"[skip] {provider_model}")
+                persist_report_snapshot(status="running", stop_reason_value=None)
+                continue
+
+            if scan_delay_seconds > 0:
+                wait_seconds = next_scheduled_start - time.monotonic()
+                if wait_seconds > 0:
+                    time.sleep(wait_seconds)
+                next_scheduled_start = max(next_scheduled_start, time.monotonic()) + scan_delay_seconds
+
+            skip_controller.set_current(provider_name, model_name)
+            single_result: Dict[str, Any]
+            try:
+                single_summary = manager.scan_models(
+                    models=[{"model": model_name, "provider": provider_name}],
+                    provider=None,
+                    prompt=args.prompt,
+                    create_kwargs={"timeout": args.timeout} if args.timeout is not None else {},
+                    delay_seconds=0.0,
+                    parallel=False,
+                    max_workers=1,
+                    on_result=None,
+                    stop_requested=lambda: bool(stream_state["stop_requested"]),
+                )
+                single_report = single_summary.to_dict()
+                single_items = list(single_report.get("results", []) or [])
+                if single_items:
+                    single_result = dict(single_items[0])
+                else:
+                    single_result = {
+                        "model": model_name,
+                        "provider": provider_name,
+                        "provider_model": provider_model,
+                        "ok": False,
+                        "status": "error",
+                        "elapsed_seconds": 0.0,
+                        "response_preview": "",
+                        "error": "No scan result was produced.",
+                    }
+            except KeyboardInterrupt:
+                raise
+            except Exception as exc:
+                single_result = {
+                    "model": model_name,
+                    "provider": provider_name,
+                    "provider_model": provider_model,
+                    "ok": False,
+                    "status": "error",
+                    "elapsed_seconds": 0.0,
+                    "response_preview": "",
+                    "error": str(exc),
+                }
+            finally:
+                skip_controller.clear_current()
+
+            if skip_controller.should_discard_current_result(provider_name, model_name):
+                print(f"[skip-current] {provider_model}")
+                persist_report_snapshot(status="running", stop_reason_value=None)
+                continue
+
+            results.append(single_result)
+            stream_state["count"] += 1
+            status = str(single_result.get("status", ""))
+            elapsed = single_result.get("elapsed_seconds", 0)
+            print(
+                f"[{stream_state['count']}] {provider_model} -> {color_scan_status(status)} ({elapsed}s)",
+                flush=True,
+            )
+            err = single_result.get("error")
+            preview = single_result.get("response_preview")
+            if err:
+                print(f"  error: {clamp(str(err), 300)}", flush=True)
+            elif preview:
+                print(f"  preview: {clamp(str(preview), 300)}", flush=True)
+            persist_report_snapshot(status="running", stop_reason_value=None)
+
+            if stream_state["stop_requested"]:
+                stop_reason = "stop_requested"
+                break
+    except KeyboardInterrupt:
+        hotkey_cleanup()
+        signal.signal(signal.SIGINT, previous_sigint)
+        print("\nScan aborted immediately.")
+        return 130
+    finally:
+        hotkey_cleanup()
+        signal.signal(signal.SIGINT, previous_sigint)
+
+    stopped = stop_reason is not None
+    final_status = "stopped" if stopped else "completed"
+    final_report = build_report_snapshot(status=final_status, stop_reason_value=stop_reason)
+    _persist_scan_report(scan_db, run_id, final_report)
+
+    if final_report.get("stopped"):
+        print(
+            f"Scan stopped early after {final_report.get('total', 0)} result(s) "
+            f"(reason={final_report.get('stop_reason') or 'stop_requested'})."
+        )
+    print_model_scan_report(final_report)
+
+    if args.output:
+        output_path = Path(args.output).resolve()
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(pretty_json(final_report) + "\n", encoding="utf-8")
+        print(f"Saved scan output to: {output_path}")
+    return 0
+
+
 def run_server_command(argv: Optional[List[str]] = None) -> int:
     ap = argparse.ArgumentParser(
         prog="g4fagent server",
@@ -701,22 +1310,19 @@ def run_server_command(argv: Optional[List[str]] = None) -> int:
         default=os.getenv("G4FAGENT_API_KEY", "dev-api-key"),
         help="API key accepted by /auth/login when method=api_key (default: env G4FAGENT_API_KEY or dev-api-key).",
     )
+    ap.add_argument(
+        "--database",
+        choices=list(DATABASE_BACKENDS),
+        default=None,
+        help="Optional persistence backend. When set, API state is loaded/saved through that backend.",
+    )
     args = ap.parse_args(argv)
 
     if args.port < 1 or args.port > 65535:
         print("--port must be between 1 and 65535")
         return 2
 
-    config_arg = Path(args.config)
-    if args.config == DEFAULT_CONFIG_REL_PATH:
-        config_base_dir = APP_ROOT
-        config_rel_path = args.config
-    elif config_arg.is_absolute():
-        config_base_dir = config_arg.parent
-        config_rel_path = config_arg.name
-    else:
-        config_base_dir = Path.cwd()
-        config_rel_path = args.config
+    config_base_dir, config_rel_path = resolve_config_location(str(args.config))
 
     workspace_dir = Path(args.workspace).resolve() if args.workspace else (Path.cwd() / ".g4fagent_api").resolve()
     workspace_dir.mkdir(parents=True, exist_ok=True)
@@ -730,12 +1336,17 @@ def run_server_command(argv: Optional[List[str]] = None) -> int:
         tools_dirs=list(args.tools_dir or []),
         auth_disabled=bool(args.auth_disabled),
         api_key=str(args.api_key),
+        database=args.database,
     )
 
 
 def main() -> int:
-    if len(sys.argv) > 1 and str(sys.argv[1]).strip().lower() == "server":
-        return run_server_command(sys.argv[2:])
+    if len(sys.argv) > 1:
+        cmd = str(sys.argv[1]).strip().lower()
+        if cmd == "server":
+            return run_server_command(sys.argv[2:])
+        if cmd == "scan-models":
+            return run_scan_models_command(sys.argv[2:])
 
     ap = argparse.ArgumentParser(description="Agentic G4F project scaffolder")
     ap.add_argument("--out", required=False, help="Output project directory")
@@ -748,6 +1359,12 @@ def main() -> int:
             "Runtime config JSON path. Default uses packaged assets; "
             "custom relative paths resolve from current working directory."
         ),
+    )
+    ap.add_argument(
+        "--database",
+        choices=list(DATABASE_BACKENDS),
+        default=None,
+        help="Optional persistence backend for runtime/project state.",
     )
     ap.add_argument("--zip", action="store_true", help="Also create a zip of the project folder")
     ap.add_argument(
@@ -803,30 +1420,6 @@ def main() -> int:
         default=None,
         help="Max tool-call turns allowed in each debug round.",
     )
-    ap.add_argument("--scan-models", action="store_true", help="Scan g4f models and report which ones respond.")
-    ap.add_argument(
-        "--scan-model",
-        action="append",
-        default=[],
-        help="Model alias/name to scan. Repeat to probe multiple specific models.",
-    )
-    ap.add_argument("--scan-provider", default=None, help="Optional provider override for model scanning.")
-    ap.add_argument(
-        "--scan-prompt",
-        default="Reply with exactly: OK",
-        help="Probe prompt used for model scanning.",
-    )
-    ap.add_argument("--scan-timeout", type=float, default=30.0, help="Per-call timeout in seconds for model scans.")
-    ap.add_argument("--scan-delay", type=float, default=0.0, help="Delay between scan starts in seconds.")
-    ap.add_argument("--scan-parallel", action="store_true", help="Run scan calls in parallel.")
-    ap.add_argument("--scan-workers", type=int, default=4, help="Max workers for parallel model scans.")
-    ap.add_argument("--scan-output", default=None, help="Optional file path to write scan JSON results.")
-    ap.add_argument("--list-providers", action="store_true", help="List valid g4f provider names and exit.")
-    ap.add_argument(
-        "--list-models-for-provider",
-        default=None,
-        help="List valid model aliases for the specified provider and exit.",
-    )
     ap.add_argument(
         "--skip-existing",
         action="store_true",
@@ -864,123 +1457,17 @@ def main() -> int:
         if requested_provider_override:
             cli_provider_override = resolve_provider_name(requested_provider_override) or requested_provider_override
 
-    list_mode_used = False
-    if args.list_providers:
-        providers = list_known_provider_names(include_meta=False)
-        print_provider_list(providers)
-        list_mode_used = True
+    config_base_dir, config_rel_path = resolve_config_location(str(args.config))
 
-    if args.list_models_for_provider is not None:
-        requested_provider = str(args.list_models_for_provider).strip()
-        if not requested_provider:
-            print("--list-models-for-provider requires a non-empty provider name.")
-            return 2
-        resolved_provider = resolve_provider_name(requested_provider)
-        if resolved_provider is None:
-            print(f"Unknown provider: {requested_provider}")
-            known = list_known_provider_names(include_meta=False)
-            if known:
-                print(f"Try one of: {', '.join(known[:30])}")
-            return 2
-        provider_models = list_known_model_names_for_provider(resolved_provider)
-        print_provider_model_list(resolved_provider, provider_models)
-        list_mode_used = True
-
-    if list_mode_used:
-        return 0
-
-    config_arg = Path(args.config)
-    if args.config == DEFAULT_CONFIG_REL_PATH:
-        config_base_dir = APP_ROOT
-        config_rel_path = args.config
-    elif config_arg.is_absolute():
-        config_base_dir = config_arg.parent
-        config_rel_path = config_arg.name
-    else:
-        config_base_dir = Path.cwd()
-        config_rel_path = args.config
-
-    manager = G4FManager.from_config(config_rel_path=config_rel_path, base_dir=config_base_dir)
-
-    if args.scan_models:
-        scan_models = [m.strip() for m in (args.scan_model or []) if isinstance(m, str) and m.strip()]
-        if args.scan_timeout is not None and args.scan_timeout <= 0:
-            print("--scan-timeout must be > 0")
-            return 2
-        if args.scan_workers <= 0:
-            print("--scan-workers must be > 0")
-            return 2
-
-        print_hr()
-        print("Scanning models...")
-        print("Press Ctrl+C once to stop early and keep partial results.")
-        stream_state = {"count": 0, "stop_requested": False}
-        previous_sigint = signal.getsignal(signal.SIGINT)
-
-        def request_scan_stop(reason: str) -> None:
-            if stream_state["stop_requested"]:
-                return
-            stream_state["stop_requested"] = True
-            print(f"\nStop requested ({reason}). Finishing current calls and returning partial results...")
-
-        def handle_sigint(_signum: int, _frame: Any) -> None:
-            if stream_state["stop_requested"]:
-                raise KeyboardInterrupt
-            request_scan_stop("Ctrl+C")
-
-        def stream_scan_result(result: Any) -> None:
-            stream_state["count"] += 1
-            model = str(getattr(result, "model", ""))
-            provider = str(getattr(result, "provider", "auto"))
-            provider_model = str(getattr(result, "provider_model", "") or provider_model_label(provider, model))
-            status = str(getattr(result, "status", ""))
-            elapsed = getattr(result, "elapsed_seconds", 0)
-            print(
-                f"[{stream_state['count']}] {provider_model} -> {color_scan_status(status)} ({elapsed}s)",
-                flush=True,
-            )
-            err = getattr(result, "error", None)
-            preview = getattr(result, "response_preview", "")
-            if err:
-                print(f"  error: {clamp(str(err), 300)}", flush=True)
-            elif preview:
-                print(f"  preview: {clamp(str(preview), 300)}", flush=True)
-
-        signal.signal(signal.SIGINT, handle_sigint)
-        try:
-            scan_summary = manager.scan_models(
-                models=scan_models or None,
-                provider=args.scan_provider,
-                prompt=args.scan_prompt,
-                create_kwargs={"timeout": args.scan_timeout} if args.scan_timeout is not None else {},
-                delay_seconds=max(0.0, float(args.scan_delay)),
-                parallel=bool(args.scan_parallel),
-                max_workers=int(args.scan_workers),
-                on_result=stream_scan_result,
-                stop_requested=lambda: bool(stream_state["stop_requested"]),
-            )
-        except KeyboardInterrupt:
-            print("\nScan aborted immediately.")
-            return 130
-        finally:
-            signal.signal(signal.SIGINT, previous_sigint)
-        report = scan_summary.to_dict()
-        if report.get("stopped"):
-            print(
-                f"Scan stopped early after {report.get('total', 0)} result(s) "
-                f"(reason={report.get('stop_reason') or 'stop_requested'})."
-            )
-        print_model_scan_report(report)
-
-        if args.scan_output:
-            output_path = Path(args.scan_output).resolve()
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            output_path.write_text(pretty_json(report) + "\n", encoding="utf-8")
-            print(f"Saved scan output to: {output_path}")
-        return 0
+    manager = G4FManager.from_config(
+        config_rel_path=config_rel_path,
+        base_dir=config_base_dir,
+        database=args.database,
+        database_base_dir=Path.cwd(),
+    )
 
     if not args.out:
-        ap.error("--out is required unless --scan-models is used.")
+        ap.error("--out is required.")
 
     out_dir = Path(args.out).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)

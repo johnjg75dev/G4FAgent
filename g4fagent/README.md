@@ -21,6 +21,7 @@ from g4fagent.constants import APP_ROOT
 manager = G4FManager.from_config(
     config_rel_path="config.json",
     base_dir=APP_ROOT,
+    database="json",  # optional: json/sqlite/mysql/mariadb/postgres/mongo
 )
 
 planning_stage, writing_stage = manager.default_stage_names()
@@ -100,3 +101,9 @@ This checks `PATH` and common OS-specific install locations for tools often used
 - `Pipeline.order` controls default stage execution order.
 - Per-stage overrides can change model/provider/params without modifying role files.
 - Optional `quality_checks` config can define lint/test commands and debug-round limits for post-write validation.
+
+## Database backends
+
+- `G4FManager.from_config(...)` and `G4FManager.from_runtime_config(...)` accept an optional `database` backend.
+- Supported backend selectors: `json`, `sqlite`, `mysql`, `mariadb`, `postgres`, `mongo`.
+- `json` is implemented today and stores one JSON file per bucket under `.g4fagent_db`.

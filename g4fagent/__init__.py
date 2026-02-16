@@ -21,6 +21,17 @@ from .core import (
     resolve_provider_name,
     scan_models,
 )
+from .database import (
+    DATABASE_BACKENDS,
+    Database,
+    JSONDatabase,
+    MariaDatabase,
+    MongoDatabase,
+    MySQLDatabase,
+    PostgresDatabase,
+    SQLiteDatabase,
+    create_database,
+)
 from .utils import detect_verification_program_paths
 
 __all__ = [
@@ -40,4 +51,13 @@ __all__ = [
     "ModelScanResult",
     "ModelScanSummary",
     "detect_verification_program_paths",
+    "Database",
+    "JSONDatabase",
+    "SQLiteDatabase",
+    "MySQLDatabase",
+    "MariaDatabase",
+    "PostgresDatabase",
+    "MongoDatabase",
+    "create_database",
+    "DATABASE_BACKENDS",
 ]
