@@ -29,6 +29,7 @@ from g4fagent import (
     list_known_provider_names,
     resolve_provider_name,
 )
+from g4fagent.api_server import run_api_server
 from g4fagent.constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH
 from g4fagent.tools import ToolResult, ToolRuntime
 from g4fagent.utils import (
@@ -663,7 +664,79 @@ def print_provider_model_list(provider_name: str, models: List[str]) -> None:
     print_hr("-")
 
 
+def run_server_command(argv: Optional[List[str]] = None) -> int:
+    ap = argparse.ArgumentParser(
+        prog="g4fagent server",
+        description="Launch the G4FAgent Dev Platform REST API server",
+    )
+    ap.add_argument("--host", default="127.0.0.1", help="Bind host (default: 127.0.0.1)")
+    ap.add_argument("--port", type=int, default=8000, help="Bind port (default: 8000)")
+    ap.add_argument("--base-path", default="/api/v1", help="Base API path prefix (default: /api/v1)")
+    ap.add_argument(
+        "--workspace",
+        default=None,
+        help="Workspace directory for API-managed project state/files (default: ./.g4fagent_api)",
+    )
+    ap.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG_REL_PATH,
+        help=(
+            "Runtime config JSON path. Default uses packaged assets; "
+            "custom relative paths resolve from current working directory."
+        ),
+    )
+    ap.add_argument(
+        "--tools-dir",
+        action="append",
+        default=[],
+        help="Additional directory containing custom tool modules (*.py). Can be repeated.",
+    )
+    ap.add_argument(
+        "--auth-disabled",
+        action="store_true",
+        help="Disable bearer auth checks (intended for local development only).",
+    )
+    ap.add_argument(
+        "--api-key",
+        default=os.getenv("G4FAGENT_API_KEY", "dev-api-key"),
+        help="API key accepted by /auth/login when method=api_key (default: env G4FAGENT_API_KEY or dev-api-key).",
+    )
+    args = ap.parse_args(argv)
+
+    if args.port < 1 or args.port > 65535:
+        print("--port must be between 1 and 65535")
+        return 2
+
+    config_arg = Path(args.config)
+    if args.config == DEFAULT_CONFIG_REL_PATH:
+        config_base_dir = APP_ROOT
+        config_rel_path = args.config
+    elif config_arg.is_absolute():
+        config_base_dir = config_arg.parent
+        config_rel_path = config_arg.name
+    else:
+        config_base_dir = Path.cwd()
+        config_rel_path = args.config
+
+    workspace_dir = Path(args.workspace).resolve() if args.workspace else (Path.cwd() / ".g4fagent_api").resolve()
+    workspace_dir.mkdir(parents=True, exist_ok=True)
+    return run_api_server(
+        host=str(args.host),
+        port=int(args.port),
+        base_path=str(args.base_path),
+        workspace_dir=workspace_dir,
+        config_rel_path=config_rel_path,
+        config_base_dir=config_base_dir,
+        tools_dirs=list(args.tools_dir or []),
+        auth_disabled=bool(args.auth_disabled),
+        api_key=str(args.api_key),
+    )
+
+
 def main() -> int:
+    if len(sys.argv) > 1 and str(sys.argv[1]).strip().lower() == "server":
+        return run_server_command(sys.argv[2:])
+
     ap = argparse.ArgumentParser(description="Agentic G4F project scaffolder")
     ap.add_argument("--out", required=False, help="Output project directory")
     ap.add_argument("--model", default=None, help="Optional model name/string for g4f")
