@@ -4,9 +4,12 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from g4fagent import config as cfgmod
+from g4fagent.constants import DEFAULT_AGENTS_REL_DIR, DEFAULT_CONFIG_REL_PATH
 from g4fagent.utils import (
+    detect_verification_program_paths,
     deep_merge_dict,
     ensure_rel_path,
     extract_plan_json,
@@ -32,10 +35,12 @@ class TestConfig(unittest.TestCase):
     def test_ensure_runtime_config_files_creates_defaults(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             base = Path(tmp)
-            config_path = cfgmod.ensure_runtime_config_files(base, "config.json")
+            config_path = cfgmod.ensure_runtime_config_files(base, DEFAULT_CONFIG_REL_PATH)
             self.assertTrue(config_path.exists())
-            self.assertTrue((base / "agents" / "PlanningAgent.json").exists())
-            self.assertTrue((base / "agents" / "WritingAgent.json").exists())
+            self.assertEqual(config_path, (base / DEFAULT_CONFIG_REL_PATH).resolve())
+            self.assertTrue((base / DEFAULT_AGENTS_REL_DIR / "PlanningAgent.json").exists())
+            self.assertTrue((base / DEFAULT_AGENTS_REL_DIR / "WritingAgent.json").exists())
+            self.assertTrue((base / DEFAULT_AGENTS_REL_DIR / "DebugAgent.json").exists())
 
     def test_load_runtime_config_raises_for_missing_agent_definitions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -95,7 +100,49 @@ class TestUtils(unittest.TestCase):
             self.assertTrue(ok)
             self.assertIn("All planned files exist", report)
 
+    @patch("g4fagent.utils.platform.system", return_value="Windows")
+    @patch("g4fagent.utils.glob.glob", return_value=[])
+    @patch("g4fagent.utils.shutil.which")
+    def test_detect_verification_program_paths_prefers_path_hits(self, which_mock, *_mocks) -> None:
+        def which_side_effect(name: str):
+            if name == "python":
+                return r"C:\Python314\python.exe"
+            if name == "ruff":
+                return r"C:\Python314\Scripts\ruff.exe"
+            return None
+
+        which_mock.side_effect = which_side_effect
+        detected = detect_verification_program_paths(programs=["python", "ruff"])
+        self.assertEqual(detected["total_programs"], 2)
+        self.assertEqual(detected["found_count"], 2)
+
+        by_name = {x["program"]: x for x in detected["results"]}
+        self.assertEqual(by_name["python"]["source"], "PATH")
+        self.assertTrue(by_name["python"]["preferred_path"].lower().endswith("python.exe"))
+        self.assertIn("-m ruff check .", " ".join(by_name["python"]["suggested_lint_commands"]))
+        self.assertEqual(by_name["ruff"]["source"], "PATH")
+        self.assertIn("check .", " ".join(by_name["ruff"]["suggested_lint_commands"]))
+
+    @patch("g4fagent.utils.platform.system", return_value="Windows")
+    @patch("g4fagent.utils.shutil.which", return_value=None)
+    @patch("g4fagent.utils.glob.glob")
+    def test_detect_verification_program_paths_uses_known_path_patterns(self, glob_mock, *_mocks) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            exe_path = Path(tmp) / "Python314" / "python.exe"
+            exe_path.parent.mkdir(parents=True, exist_ok=True)
+            exe_path.write_text("", encoding="utf-8")
+
+            def glob_side_effect(_pattern: str):
+                return [str(exe_path)]
+
+            glob_mock.side_effect = glob_side_effect
+            detected = detect_verification_program_paths(programs=["python"])
+            self.assertEqual(detected["found_count"], 1)
+            python_result = detected["results"][0]
+            self.assertEqual(python_result["source"], "KNOWN_PATH")
+            self.assertTrue(str(exe_path).lower().endswith("python.exe"))
+            self.assertTrue(python_result["all_paths"])
+
 
 if __name__ == "__main__":
     unittest.main()
-

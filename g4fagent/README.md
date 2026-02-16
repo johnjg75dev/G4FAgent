@@ -65,9 +65,38 @@ runtime = ToolRuntime(
 print(runtime.available_tools())
 ```
 
+## Model scan utility
+
+```python
+from g4fagent import scan_models
+
+summary = scan_models(
+    models=["gpt_4o", "gpt_4o_mini"],  # or None to scan known aliases
+    parallel=True,
+    max_workers=4,
+    delay_seconds=0.5,  # stagger requests to avoid spamming providers
+    create_kwargs={"timeout": 30},
+)
+
+print(summary.to_dict()["working_models"])
+```
+
+## Program path auto-detect
+
+```python
+from g4fagent import detect_verification_program_paths
+
+detected = detect_verification_program_paths()
+print(detected["results"][0])
+```
+
+This checks `PATH` and common OS-specific install locations for tools often used in lint/test verification and debug-fix loops.
+
 ## Configuration model
 
 - Runtime config comes from `config.json`.
+- Packaged defaults are bundled at `assets/config.json` + `assets/agents/*.json`.
 - Role definitions come from `agents/<RoleName>.json`.
 - `Pipeline.order` controls default stage execution order.
 - Per-stage overrides can change model/provider/params without modifying role files.
+- Optional `quality_checks` config can define lint/test commands and debug-round limits for post-write validation.

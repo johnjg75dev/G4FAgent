@@ -6,13 +6,47 @@ build-backend = "setuptools.build_meta"
 name = "g4fagent"
 version = "0.1.0"
 description = "Agentic scaffolding SDK built on g4f"
+readme = "README.md"
 requires-python = ">=3.10"
+keywords = ["g4f", "agents", "scaffolding", "llm", "automation"]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Intended Audience :: Developers",
+  "Topic :: Software Development :: Code Generators",
+  "Topic :: Scientific/Engineering :: Artificial Intelligence",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
 dependencies = [
   "g4f",
+  "typing-extensions>=4.8.0",
+]
+
+[project.scripts]
+g4fagent = "main:main"
+
+[project.optional-dependencies]
+dev = [
+  "build>=1.2.2",
+  "twine>=5.1.1",
+]
+test = [
+  "build>=1.2.2",
 ]
 
 [tool.setuptools]
 include-package-data = true
+py-modules = ["main"]
 
 [tool.setuptools.packages.find]
-include = ["g4fagent*", "tools*"]
+include = ["g4fagent*"]
+
+[tool.setuptools.package-data]
+g4fagent = [
+  "README.md",
+  "assets/config.json",
+  "assets/agents/*.json",
+]

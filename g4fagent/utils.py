@@ -16,12 +16,171 @@ from __future__ import annotations
 import copy
 import datetime as _dt
 import difflib
+import glob
 import json
 import os
+import platform
 import py_compile
 import re
+import shutil
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
+
+
+DEFAULT_VERIFICATION_PROGRAMS: List[str] = [
+    "python",
+    "pip",
+    "pytest",
+    "ruff",
+    "mypy",
+    "black",
+    "node",
+    "npm",
+    "pnpm",
+    "yarn",
+    "eslint",
+    "prettier",
+    "jest",
+    "vitest",
+    "go",
+    "golangci-lint",
+    "cargo",
+    "rustc",
+    "rustfmt",
+    "dotnet",
+    "java",
+    "javac",
+    "mvn",
+    "gradle",
+]
+
+PROGRAM_ALIASES: Dict[str, List[str]] = {
+    "python": ["python", "python3", "py"],
+    "pip": ["pip", "pip3"],
+    "pytest": ["pytest"],
+    "ruff": ["ruff"],
+    "mypy": ["mypy"],
+    "black": ["black"],
+    "node": ["node"],
+    "npm": ["npm"],
+    "pnpm": ["pnpm"],
+    "yarn": ["yarn"],
+    "eslint": ["eslint"],
+    "prettier": ["prettier"],
+    "jest": ["jest"],
+    "vitest": ["vitest"],
+    "go": ["go"],
+    "golangci-lint": ["golangci-lint"],
+    "cargo": ["cargo"],
+    "rustc": ["rustc"],
+    "rustfmt": ["rustfmt"],
+    "dotnet": ["dotnet"],
+    "java": ["java"],
+    "javac": ["javac"],
+    "mvn": ["mvn", "mvn.cmd"],
+    "gradle": ["gradle", "gradle.bat"],
+}
+
+PROGRAM_COMMAND_TEMPLATES: Dict[str, Dict[str, List[str]]] = {
+    "python": {
+        "lint": ["{exe} -m ruff check .", "{exe} -m mypy ."],
+        "test": ['{exe} -m pytest -q', '{exe} -m unittest discover -s tests -p "test_*.py"'],
+    },
+    "pip": {},
+    "pytest": {"test": ["{exe} -q"]},
+    "ruff": {"lint": ["{exe} check ."]},
+    "mypy": {"lint": ["{exe} ."]},
+    "black": {"lint": ["{exe} --check ."]},
+    "node": {"test": ["{exe} --test"]},
+    "npm": {"lint": ["{exe} run lint"], "test": ["{exe} test"]},
+    "pnpm": {"lint": ["{exe} lint"], "test": ["{exe} test"]},
+    "yarn": {"lint": ["{exe} lint"], "test": ["{exe} test"]},
+    "eslint": {"lint": ["{exe} ."]},
+    "prettier": {"lint": ["{exe} --check ."]},
+    "jest": {"test": ["{exe}"]},
+    "vitest": {"test": ["{exe} run"]},
+    "go": {"lint": ["{exe} vet ./..."], "test": ["{exe} test ./..."]},
+    "golangci-lint": {"lint": ["{exe} run"]},
+    "cargo": {"lint": ["{exe} clippy --all-targets -- -D warnings"], "test": ["{exe} test"]},
+    "rustc": {},
+    "rustfmt": {"lint": ["{exe} --check src/**/*.rs"]},
+    "dotnet": {"lint": ["{exe} format --verify-no-changes"], "test": ["{exe} test"]},
+    "java": {},
+    "javac": {},
+    "mvn": {"test": ["{exe} test"]},
+    "gradle": {"test": ["{exe} test"]},
+}
+
+KNOWN_PROGRAM_PATH_PATTERNS: Dict[str, Dict[str, List[str]]] = {
+    "Windows": {
+        "python": [
+            r"C:\Python*\python.exe",
+            r"%LOCALAPPDATA%\Programs\Python\Python*\python.exe",
+            r"%ProgramFiles%\Python*\python.exe",
+            r"%ProgramFiles(x86)%\Python*\python.exe",
+        ],
+        "pip": [
+            r"C:\Python*\Scripts\pip.exe",
+            r"%LOCALAPPDATA%\Programs\Python\Python*\Scripts\pip.exe",
+            r"%ProgramFiles%\Python*\Scripts\pip.exe",
+            r"%ProgramFiles(x86)%\Python*\Scripts\pip.exe",
+        ],
+        "node": [r"%ProgramFiles%\nodejs\node.exe", r"%ProgramFiles(x86)%\nodejs\node.exe"],
+        "npm": [r"%ProgramFiles%\nodejs\npm.cmd", r"%ProgramFiles(x86)%\nodejs\npm.cmd"],
+        "pnpm": [r"%APPDATA%\npm\pnpm.cmd", r"%LOCALAPPDATA%\pnpm\pnpm.exe"],
+        "yarn": [r"%APPDATA%\npm\yarn.cmd"],
+        "go": [r"%ProgramFiles%\Go\bin\go.exe"],
+        "golangci-lint": [r"%USERPROFILE%\go\bin\golangci-lint.exe"],
+        "cargo": [r"%USERPROFILE%\.cargo\bin\cargo.exe"],
+        "rustc": [r"%USERPROFILE%\.cargo\bin\rustc.exe"],
+        "rustfmt": [r"%USERPROFILE%\.cargo\bin\rustfmt.exe"],
+        "dotnet": [r"%ProgramFiles%\dotnet\dotnet.exe", r"%ProgramFiles(x86)%\dotnet\dotnet.exe"],
+        "java": [
+            r"%ProgramFiles%\Java\*\bin\java.exe",
+            r"%ProgramFiles%\Eclipse Adoptium\*\bin\java.exe",
+            r"%ProgramFiles(x86)%\Java\*\bin\java.exe",
+        ],
+        "javac": [
+            r"%ProgramFiles%\Java\*\bin\javac.exe",
+            r"%ProgramFiles%\Eclipse Adoptium\*\bin\javac.exe",
+            r"%ProgramFiles(x86)%\Java\*\bin\javac.exe",
+        ],
+    },
+    "Linux": {
+        "python": ["/usr/bin/python3", "/usr/local/bin/python3", "/usr/bin/python"],
+        "pip": ["/usr/bin/pip3", "/usr/local/bin/pip3", "/usr/bin/pip"],
+        "node": ["/usr/bin/node", "/usr/local/bin/node"],
+        "npm": ["/usr/bin/npm", "/usr/local/bin/npm"],
+        "pnpm": ["/usr/bin/pnpm", "/usr/local/bin/pnpm"],
+        "yarn": ["/usr/bin/yarn", "/usr/local/bin/yarn"],
+        "go": ["/usr/local/go/bin/go", "/usr/bin/go"],
+        "cargo": ["~/.cargo/bin/cargo"],
+        "rustc": ["~/.cargo/bin/rustc"],
+        "rustfmt": ["~/.cargo/bin/rustfmt"],
+        "dotnet": ["/usr/bin/dotnet", "/usr/local/bin/dotnet"],
+        "java": ["/usr/bin/java", "/usr/local/bin/java"],
+        "javac": ["/usr/bin/javac", "/usr/local/bin/javac"],
+        "mvn": ["/usr/bin/mvn", "/usr/local/bin/mvn"],
+        "gradle": ["/usr/bin/gradle", "/usr/local/bin/gradle"],
+    },
+    "Darwin": {
+        "python": ["/usr/bin/python3", "/usr/local/bin/python3", "/opt/homebrew/bin/python3"],
+        "pip": ["/usr/bin/pip3", "/usr/local/bin/pip3", "/opt/homebrew/bin/pip3"],
+        "node": ["/usr/local/bin/node", "/opt/homebrew/bin/node"],
+        "npm": ["/usr/local/bin/npm", "/opt/homebrew/bin/npm"],
+        "pnpm": ["/usr/local/bin/pnpm", "/opt/homebrew/bin/pnpm"],
+        "yarn": ["/usr/local/bin/yarn", "/opt/homebrew/bin/yarn"],
+        "go": ["/usr/local/go/bin/go", "/opt/homebrew/bin/go"],
+        "cargo": ["~/.cargo/bin/cargo"],
+        "rustc": ["~/.cargo/bin/rustc"],
+        "rustfmt": ["~/.cargo/bin/rustfmt"],
+        "dotnet": ["/usr/local/share/dotnet/dotnet", "/usr/local/bin/dotnet", "/opt/homebrew/bin/dotnet"],
+        "java": ["/usr/bin/java", "/usr/local/bin/java"],
+        "javac": ["/usr/bin/javac", "/usr/local/bin/javac"],
+        "mvn": ["/usr/local/bin/mvn", "/opt/homebrew/bin/mvn"],
+        "gradle": ["/usr/local/bin/gradle", "/opt/homebrew/bin/gradle"],
+    },
+}
 
 
 def now_iso() -> str:
@@ -68,6 +227,139 @@ def clamp(s: str, limit: int = 4000) -> str:
     """
     s = s or ""
     return s if len(s) <= limit else s[:limit] + "\n...<truncated>..."
+
+
+def _uniq_strs(values: Sequence[str]) -> List[str]:
+    seen: set[str] = set()
+    out: List[str] = []
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        out.append(value)
+    return out
+
+
+def _quote_executable(path: str) -> str:
+    if not path:
+        return path
+    if " " in path or "\t" in path:
+        return f"\"{path}\""
+    return path
+
+
+def _expand_path_pattern(pattern: str) -> List[str]:
+    expanded = os.path.expandvars(os.path.expanduser(pattern))
+    matches = glob.glob(expanded)
+    found: List[str] = []
+    for m in matches:
+        p = Path(m)
+        if not p.exists() or not p.is_file():
+            continue
+        try:
+            found.append(str(p.resolve()))
+        except Exception:
+            found.append(str(p))
+    return _uniq_strs(found)
+
+
+def detect_verification_program_paths(
+    programs: Optional[Sequence[str]] = None,
+    *,
+    max_matches_per_program: int = 5,
+) -> Dict[str, Any]:
+    """Detect common language/tool executables and suggest lint/test commands.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = detect_verification_program_paths(...)
+    ```
+    """
+    requested = programs if programs is not None else DEFAULT_VERIFICATION_PROGRAMS
+    normalized_programs = [str(p).strip().lower() for p in requested if str(p).strip()]
+    normalized_programs = _uniq_strs(normalized_programs)
+
+    platform_name = platform.system()
+    platform_patterns = KNOWN_PROGRAM_PATH_PATTERNS.get(platform_name, {})
+    max_matches = max(1, int(max_matches_per_program))
+
+    results: List[Dict[str, Any]] = []
+    lint_suggestions: List[str] = []
+    test_suggestions: List[str] = []
+
+    for program in normalized_programs:
+        aliases = PROGRAM_ALIASES.get(program, [program])
+        path_hits: List[str] = []
+        found_via_alias: Dict[str, str] = {}
+        for alias in aliases:
+            resolved = shutil.which(alias)
+            if not resolved:
+                continue
+            resolved_path = str(Path(resolved).resolve())
+            path_hits.append(resolved_path)
+            found_via_alias[alias] = resolved_path
+
+        known_hits: List[str] = []
+        checked_patterns: List[str] = []
+        for pattern in platform_patterns.get(program, []):
+            expanded = os.path.expandvars(os.path.expanduser(pattern))
+            checked_patterns.append(expanded)
+            known_hits.extend(_expand_path_pattern(pattern))
+
+        path_hits = _uniq_strs(path_hits)
+        known_hits = _uniq_strs(known_hits)
+        all_hits = _uniq_strs(path_hits + known_hits)[:max_matches]
+        preferred_path = path_hits[0] if path_hits else (known_hits[0] if known_hits else None)
+
+        found = bool(all_hits)
+        source: Optional[str] = None
+        if path_hits:
+            source = "PATH"
+        elif known_hits:
+            source = "KNOWN_PATH"
+
+        lint_cmds: List[str] = []
+        test_cmds: List[str] = []
+        if found and preferred_path:
+            templates = PROGRAM_COMMAND_TEMPLATES.get(program, {})
+            quoted_exe = _quote_executable(preferred_path)
+            lint_cmds = [tpl.format(exe=quoted_exe) for tpl in templates.get("lint", [])]
+            test_cmds = [tpl.format(exe=quoted_exe) for tpl in templates.get("test", [])]
+            lint_suggestions.extend(lint_cmds)
+            test_suggestions.extend(test_cmds)
+
+        results.append(
+            {
+                "program": program,
+                "aliases_checked": aliases,
+                "found": found,
+                "preferred_path": preferred_path,
+                "all_paths": all_hits,
+                "source": source,
+                "found_via_alias": found_via_alias,
+                "known_path_patterns_checked": checked_patterns,
+                "suggested_lint_commands": lint_cmds,
+                "suggested_test_commands": test_cmds,
+            }
+        )
+
+    lint_suggestions = _uniq_strs(lint_suggestions)
+    test_suggestions = _uniq_strs(test_suggestions)
+    found_count = sum(1 for r in results if r.get("found"))
+    return {
+        "scanned_at": now_iso(),
+        "platform": platform_name,
+        "total_programs": len(results),
+        "found_count": found_count,
+        "missing_count": len(results) - found_count,
+        "lint_command_suggestions": lint_suggestions,
+        "test_command_suggestions": test_suggestions,
+        "results": results,
+    }
 
 
 def prompt_multiline(title: str) -> str:

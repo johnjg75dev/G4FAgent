@@ -17,9 +17,9 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-APP_ROOT = Path(__file__).resolve().parent.parent
-DEFAULT_CONFIG_REL_PATH = "config.json"
-DEFAULT_AGENTS_REL_DIR = "agents"
+APP_ROOT = Path(__file__).resolve().parent
+DEFAULT_CONFIG_REL_PATH = "assets/config.json"
+DEFAULT_AGENTS_REL_DIR = "assets/agents"
 
 G4F_SUPPORTED_CHAT_PARAMS = {
     "stream",
@@ -129,6 +129,23 @@ Output rules:
 - No surrounding markdown fences unless the user asks.
 """
 
+DEFAULT_DEBUG_USER_PROMPT_TEMPLATE = """Project context:
+{project_context_json}
+
+Quality-check outputs (stdout/stderr, errors, warnings):
+{quality_report_json}
+
+Fix instructions:
+- Fix the reported issues so lint/tests pass.
+- Use tools to inspect and modify files.
+- Make focused, minimal edits tied to the reported outputs.
+- If checks show warnings, address meaningful warnings where practical.
+
+Output rules:
+- If using a tool, respond with ONLY the JSON tool-call envelope.
+- If not using a tool, summarize what was changed and what to re-run.
+"""
+
 DEFAULT_AGENTS: Dict[str, Dict[str, Any]] = {
     "PlanningAgent": {
         "role": "PlanningAgent",
@@ -152,12 +169,23 @@ DEFAULT_AGENTS: Dict[str, Dict[str, Any]] = {
             "temperature": 0.2,
         },
     },
+    "DebugAgent": {
+        "role": "DebugAgent",
+        "description": "Fixes lint/test failures using command output context and tools.",
+        "model": "default",
+        "provider": None,
+        "prompt": DEFAULT_SYSTEM_PROMPT,
+        "user_prompt_template": DEFAULT_DEBUG_USER_PROMPT_TEMPLATE,
+        "g4f_params": {
+            "temperature": 0.1,
+        },
+    },
 }
 
 DEFAULT_CONFIG: Dict[str, Any] = {
     "agents_dir": DEFAULT_AGENTS_REL_DIR,
     "pipeline": {
-        "order": ["planning", "writing"],
+        "order": ["planning", "writing", "debug"],
         "stages": {
             "planning": {
                 "role": "PlanningAgent",
@@ -175,7 +203,21 @@ DEFAULT_CONFIG: Dict[str, Any] = {
                     "g4f_params": {},
                 },
             },
+            "debug": {
+                "role": "DebugAgent",
+                "overrides": {
+                    "model": None,
+                    "provider": None,
+                    "g4f_params": {},
+                },
+            },
         },
+    },
+    "quality_checks": {
+        "lint_commands": [],
+        "test_commands": [],
+        "max_debug_rounds": 2,
+        "debug_max_tool_steps": 10,
     },
     "g4f_defaults": {
         "max_retries": 2,

@@ -13,16 +13,22 @@ Agentic scaffolding toolkit built on top of `g4f`.
 
 ```bash
 pip install -e .
+# or from PyPI once published:
+# pip install g4fagent
 ```
 
 ## Run the CLI
 
 ```bash
-python main.py --out ./my_project
-python main.py --out ./my_project --config ./config.json
-python main.py --out ./my_project --model gpt-4o-mini --temperature 0.2
-python main.py --out ./my_project --tools-dir ./custom_tools
+g4fagent --out ./my_project
+g4fagent --out ./my_project --config ./config.json
+g4fagent --out ./my_project --model gpt-4o-mini --temperature 0.2
+g4fagent --out ./my_project --tools-dir ./custom_tools
+g4fagent --out ./my_project --lint-cmd "ruff check ." --test-cmd "python -m unittest discover -s tests -p test_offline*.py"
 ```
+
+If lint/test commands fail and a `debug` stage is configured, the CLI can auto-run debug rounds that feed stdout/stderr/errors/warnings back to `DebugAgent` for fixes.
+
 
 ## Run tests
 
@@ -40,6 +46,21 @@ The suite now includes MCP-tool tests:
 - Offline: direct `ToolRuntime` execution of MCP-style tools
 - Online: model-generated MCP tool call envelope + runtime execution
 
+## Build and publish
+
+```bash
+python -m pip install --upgrade build twine
+python -m build
+python -m twine check dist/*
+python -m twine upload dist/*
+```
+
+For a dry run, upload to TestPyPI first:
+
+```bash
+python -m twine upload --repository testpypi dist/*
+```
+
 ## SDK quick start
 
 ```python
@@ -50,6 +71,32 @@ manager = G4FManager.from_config(config_rel_path="config.json", base_dir=APP_ROO
 print(manager.list_agents())
 print(manager.list_stages())
 ```
+
+## Scan available models
+
+```python
+from g4fagent import scan_models
+
+summary = scan_models(
+    parallel=True,
+    max_workers=4,
+    delay_seconds=0.5,
+    create_kwargs={"timeout": 30},
+)
+print(summary.to_dict()["working_models"])
+```
+
+## Auto-detect verifier binaries
+
+```python
+from g4fagent import detect_verification_program_paths
+
+detected = detect_verification_program_paths()
+print(detected["lint_command_suggestions"][:3])
+print(detected["test_command_suggestions"][:3])
+```
+
+This checks `PATH` plus common OS-specific locations (for example Windows Python installs such as `C:\\Python*\\python.exe`) to help populate lint/test config commands.
 
 ## Notes
 

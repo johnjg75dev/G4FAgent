@@ -1,0 +1,3 @@
+include README.md
+recursive-include g4fagent/assets *.json
+recursive-include g4fagent *.md

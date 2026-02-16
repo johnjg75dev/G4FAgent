@@ -13,6 +13,8 @@ manager = G4FManager.from_config()
 
 from __future__ import annotations
 
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -20,7 +22,15 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from .config import load_runtime_config, resolve_pipeline_stages
 from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH, G4F_SUPPORTED_CHAT_PARAMS
-from .utils import clamp, deep_merge_dict, format_template, msg, now_iso, pretty_json
+from .utils import (
+    clamp,
+    deep_merge_dict,
+    detect_verification_program_paths as detect_verification_program_paths_util,
+    format_template,
+    msg,
+    now_iso,
+    pretty_json,
+)
 
 try:
     import g4f
@@ -163,6 +173,296 @@ def merge_prompt_media_kwargs(
         kwargs["image_name"] = image_name
 
     return kwargs
+
+
+def _coerce_chat_response_text(resp: Any) -> str:
+    """Extract a text payload from supported g4f response shapes.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = _coerce_chat_response_text(...)
+    ```
+    """
+    if isinstance(resp, str):
+        return resp
+    if isinstance(resp, dict):
+        try:
+            return str(resp["choices"][0]["message"]["content"])
+        except Exception:
+            return str(resp)
+    return str(resp)
+
+
+def list_known_model_names(include_defaults: bool = True) -> List[str]:
+    """Return model aliases discovered from `g4f.models`.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = list_known_model_names(...)
+    ```
+    """
+    model_cls = getattr(g4f.models, "Model", None)
+    if model_cls is None:
+        return []
+
+    names: List[str] = []
+    for attr_name, attr_value in vars(g4f.models).items():
+        if attr_name.startswith("_"):
+            continue
+        if not isinstance(attr_value, model_cls):
+            continue
+        if not include_defaults and attr_name.startswith("default"):
+            continue
+        names.append(attr_name)
+    return sorted(names)
+
+
+@dataclass
+class ModelScanResult:
+    """Represents one model probe outcome from a model-availability scan.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - ModelScanResult: A configured `ModelScanResult` instance.
+    Example:
+    ```python
+    obj = ModelScanResult(...)
+    ```
+    """
+
+    model: str
+    ok: bool
+    status: str
+    elapsed_seconds: float
+    response_preview: str = ""
+    error: Optional[str] = None
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the scan result into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "model": self.model,
+            "ok": self.ok,
+            "status": self.status,
+            "elapsed_seconds": self.elapsed_seconds,
+            "response_preview": self.response_preview,
+            "error": self.error,
+        }
+
+
+@dataclass
+class ModelScanSummary:
+    """Aggregated output from a full model-availability scan run.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - ModelScanSummary: A configured `ModelScanSummary` instance.
+    Example:
+    ```python
+    obj = ModelScanSummary(...)
+    ```
+    """
+
+    started_at: str
+    finished_at: str
+    duration_seconds: float
+    prompt: str
+    provider: Optional[str]
+    delay_seconds: float
+    parallel: bool
+    max_workers: int
+    results: List[ModelScanResult] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the scan summary into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        working = [r.model for r in self.results if r.ok]
+        failing = [r.model for r in self.results if not r.ok]
+        no_response = [r for r in self.results if r.status == "no_response"]
+        errors = [r for r in self.results if r.status == "error"]
+        return {
+            "started_at": self.started_at,
+            "finished_at": self.finished_at,
+            "duration_seconds": self.duration_seconds,
+            "prompt": self.prompt,
+            "provider": self.provider,
+            "delay_seconds": self.delay_seconds,
+            "parallel": self.parallel,
+            "max_workers": self.max_workers,
+            "total": len(self.results),
+            "ok_count": len(working),
+            "failed_count": len(failing),
+            "no_response_count": len(no_response),
+            "error_count": len(errors),
+            "working_models": working,
+            "failing_models": failing,
+            "results": [r.to_dict() for r in self.results],
+        }
+
+
+def _resolve_scan_target(model: Any) -> Tuple[str, Any]:
+    if isinstance(model, str):
+        model_name = model.strip()
+        if not model_name:
+            return "", ""
+        resolved = getattr(g4f.models, model_name, None)
+        if resolved is None:
+            return model_name, model_name
+        return model_name, resolved
+
+    label = getattr(model, "name", None)
+    if isinstance(label, str) and label.strip():
+        return label, model
+    return str(model), model
+
+
+def scan_models(
+    models: Optional[List[Any]] = None,
+    *,
+    provider: Optional[str] = None,
+    prompt: str = "Reply with exactly: OK",
+    create_kwargs: Optional[Dict[str, Any]] = None,
+    delay_seconds: float = 0.0,
+    parallel: bool = False,
+    max_workers: int = 4,
+    response_preview_chars: int = 180,
+) -> ModelScanSummary:
+    """Probe models with a lightweight prompt and classify success/failure.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = scan_models(...)
+    ```
+    """
+    raw_targets = list(models) if models is not None else list_known_model_names(include_defaults=True)
+    targets: List[Tuple[int, str, Any]] = []
+    for raw in raw_targets:
+        label, target = _resolve_scan_target(raw)
+        if not label:
+            continue
+        targets.append((len(targets), label, target))
+
+    scan_prompt = (prompt or "").strip() or "Reply with exactly: OK"
+    sanitized_kwargs = {k: v for k, v in (create_kwargs or {}).items() if v is not None}
+    base_messages = [msg("user", scan_prompt)]
+
+    delay = max(0.0, float(delay_seconds))
+    workers = max(1, int(max_workers))
+    started_at = now_iso()
+    started_monotonic = time.monotonic()
+
+    def run_single(idx: int, label: str, model_value: Any) -> Tuple[int, ModelScanResult]:
+        if delay > 0:
+            scheduled_start = started_monotonic + (idx * delay)
+            wait = scheduled_start - time.monotonic()
+            if wait > 0:
+                time.sleep(wait)
+
+        scan_start = time.perf_counter()
+        try:
+            response = g4f.ChatCompletion.create(
+                model=model_value,
+                messages=base_messages,
+                provider=provider,
+                **sanitized_kwargs,
+            )
+            text = _coerce_chat_response_text(response).strip()
+            elapsed = round(time.perf_counter() - scan_start, 4)
+            if not text:
+                return (
+                    idx,
+                    ModelScanResult(
+                        model=label,
+                        ok=False,
+                        status="no_response",
+                        elapsed_seconds=elapsed,
+                        error="No response content returned.",
+                    ),
+                )
+            return (
+                idx,
+                ModelScanResult(
+                    model=label,
+                    ok=True,
+                    status="ok",
+                    elapsed_seconds=elapsed,
+                    response_preview=clamp(text, response_preview_chars),
+                ),
+            )
+        except Exception as e:
+            elapsed = round(time.perf_counter() - scan_start, 4)
+            return (
+                idx,
+                ModelScanResult(
+                    model=label,
+                    ok=False,
+                    status="error",
+                    elapsed_seconds=elapsed,
+                    error=str(e),
+                ),
+            )
+
+    indexed_results: List[Tuple[int, ModelScanResult]] = []
+    use_parallel = bool(parallel and workers > 1 and len(targets) > 1)
+    if use_parallel:
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            future_map = {
+                pool.submit(run_single, idx, label, model_value): idx
+                for idx, label, model_value in targets
+            }
+            for fut in as_completed(future_map):
+                indexed_results.append(fut.result())
+    else:
+        for idx, label, model_value in targets:
+            indexed_results.append(run_single(idx, label, model_value))
+
+    indexed_results.sort(key=lambda item: item[0])
+    results = [item[1] for item in indexed_results]
+    finished_at = now_iso()
+    duration = round(time.monotonic() - started_monotonic, 4)
+    return ModelScanSummary(
+        started_at=started_at,
+        finished_at=finished_at,
+        duration_seconds=duration,
+        prompt=scan_prompt,
+        provider=provider,
+        delay_seconds=delay,
+        parallel=use_parallel,
+        max_workers=workers,
+        results=results,
+    )
 
 
 @dataclass
@@ -1246,6 +1546,95 @@ class G4FManager:
             fallback_retries=self.cfg.max_retries,
         )
 
+    def scan_models(
+        self,
+        models: Optional[List[Any]] = None,
+        *,
+        provider: Optional[str] = None,
+        prompt: str = "Reply with exactly: OK",
+        create_kwargs: Optional[Dict[str, Any]] = None,
+        delay_seconds: float = 0.0,
+        parallel: bool = False,
+        max_workers: int = 4,
+        response_preview_chars: int = 180,
+    ) -> ModelScanSummary:
+        """Run model availability probing using runtime defaults plus overrides.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.scan_models(...)
+        ```
+        """
+        defaults = (self.runtime_cfg.get("g4f_defaults", {}) or {})
+        scan_excluded_keys = {
+            "max_retries",
+            "response_format",
+            "stream",
+            "tool_calls",
+            "tools",
+            "parallel_tool_calls",
+            "tool_choice",
+            "conversation_id",
+            "conversation",
+            "image",
+            "image_name",
+            "images",
+            "media",
+            "audio",
+            "modalities",
+            "download_media",
+        }
+        merged_kwargs: Dict[str, Any] = {}
+        for k, v in defaults.items():
+            if k in scan_excluded_keys:
+                continue
+            if k not in G4F_SUPPORTED_CHAT_PARAMS:
+                continue
+            if v is None:
+                continue
+            merged_kwargs[k] = v
+        for k, v in (create_kwargs or {}).items():
+            if v is None:
+                continue
+            merged_kwargs[k] = v
+
+        return scan_models(
+            models=models,
+            provider=provider,
+            prompt=prompt,
+            create_kwargs=merged_kwargs,
+            delay_seconds=delay_seconds,
+            parallel=parallel,
+            max_workers=max_workers,
+            response_preview_chars=response_preview_chars,
+        )
+
+    def detect_verification_program_paths(
+        self,
+        programs: Optional[List[str]] = None,
+        *,
+        max_matches_per_program: int = 5,
+    ) -> Dict[str, Any]:
+        """Detect common verifier/debug-cycle executables and command suggestions.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.detect_verification_program_paths(...)
+        ```
+        """
+        return detect_verification_program_paths_util(
+            programs=programs,
+            max_matches_per_program=max_matches_per_program,
+        )
+
     def chat(
         self,
         messages: Messages,
@@ -1297,16 +1686,7 @@ class G4FManager:
                     provider=provider,
                     **create_kwargs,
                 )
-                text_response = ""
-                if isinstance(resp, str):
-                    text_response = resp
-                elif isinstance(resp, dict):
-                    try:
-                        text_response = resp["choices"][0]["message"]["content"]
-                    except Exception:
-                        text_response = str(resp)
-                else:
-                    text_response = str(resp)
+                text_response = _coerce_chat_response_text(resp)
                 self.project.record_chat(
                     stage_name=stage_name,
                     role_name=role_name,

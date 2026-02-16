@@ -7,12 +7,15 @@ from g4fagent.core import (
     Agent,
     G4FManager,
     LLMConfig,
+    ModelScanSummary,
     Pipeline,
     Project,
     Stage,
     enforce_strict_json_object_response_format,
+    list_known_model_names,
     merge_prompt_media_kwargs,
     resolve_model_name,
+    scan_models,
 )
 from g4fagent.utils import msg
 
@@ -198,6 +201,98 @@ class TestManagerChat(unittest.TestCase):
         self.assertEqual(call_kwargs["image_name"], "img.png")
 
 
+class TestModelScanner(unittest.TestCase):
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_classifies_ok_no_response_and_error(self, create_mock) -> None:
+        def side_effect(*args, **kwargs):
+            model = kwargs.get("model")
+            if model == "good-model":
+                return "OK"
+            if model == "empty-model":
+                return "   "
+            raise RuntimeError("model unavailable")
+
+        create_mock.side_effect = side_effect
+        summary = scan_models(
+            models=["good-model", "empty-model", "bad-model"],
+            delay_seconds=0,
+            parallel=False,
+        )
+        self.assertIsInstance(summary, ModelScanSummary)
+        serialized = summary.to_dict()
+        self.assertEqual(serialized["total"], 3)
+        self.assertEqual(serialized["ok_count"], 1)
+        self.assertEqual(serialized["no_response_count"], 1)
+        self.assertEqual(serialized["error_count"], 1)
+
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_parallel_mode(self, create_mock) -> None:
+        create_mock.return_value = "OK"
+        summary = scan_models(
+            models=["m1", "m2", "m3", "m4"],
+            parallel=True,
+            max_workers=3,
+            delay_seconds=0,
+        )
+        serialized = summary.to_dict()
+        self.assertTrue(serialized["parallel"])
+        self.assertEqual(serialized["ok_count"], 4)
+        self.assertEqual(create_mock.call_count, 4)
+
+    @patch("g4fagent.core.g4f.models", create=True)
+    def test_list_known_model_names_returns_sorted_aliases(self, mock_models) -> None:
+        class FakeModel:
+            pass
+
+        mock_models.Model = FakeModel
+        mock_models.zed = FakeModel()
+        mock_models.alpha = FakeModel()
+        mock_models.default = FakeModel()
+
+        result = list_known_model_names(include_defaults=False)
+        self.assertEqual(result, ["alpha", "zed"])
+
+    @patch("g4fagent.core.scan_models")
+    def test_manager_scan_models_merges_defaults_and_passes_kwargs(self, scan_mock) -> None:
+        manager = G4FManager.from_runtime_config(
+            make_runtime_cfg(),
+            cfg=LLMConfig(max_retries=1, log_requests=False),
+        )
+        scan_mock.return_value = ModelScanSummary(
+            started_at="s",
+            finished_at="f",
+            duration_seconds=0.1,
+            prompt="p",
+            provider=None,
+            delay_seconds=0.0,
+            parallel=False,
+            max_workers=1,
+            results=[],
+        )
+
+        _ = manager.scan_models(models=["gpt_4o"], create_kwargs={"timeout": 30}, parallel=True, max_workers=2)
+
+        call_kwargs = scan_mock.call_args.kwargs
+        self.assertEqual(call_kwargs["models"], ["gpt_4o"])
+        self.assertEqual(call_kwargs["parallel"], True)
+        self.assertEqual(call_kwargs["max_workers"], 2)
+        self.assertEqual(call_kwargs["create_kwargs"]["timeout"], 30)
+
+    @patch("g4fagent.core.detect_verification_program_paths_util")
+    def test_manager_detect_verification_program_paths_forwards_args(self, detect_mock) -> None:
+        manager = G4FManager.from_runtime_config(
+            make_runtime_cfg(),
+            cfg=LLMConfig(max_retries=1, log_requests=False),
+        )
+        detect_mock.return_value = {"total_programs": 1, "found_count": 1, "results": []}
+
+        result = manager.detect_verification_program_paths(programs=["python"], max_matches_per_program=3)
+        self.assertEqual(result["found_count"], 1)
+        detect_mock.assert_called_once_with(
+            programs=["python"],
+            max_matches_per_program=3,
+        )
+
+
 if __name__ == "__main__":
     unittest.main()
-
