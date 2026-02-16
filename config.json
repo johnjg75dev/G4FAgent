@@ -1,0 +1,65 @@
+{
+  "agents_dir": "agents",
+  "pipeline": {
+    "order": [
+      "planning",
+      "writing"
+    ],
+    "stages": {
+      "planning": {
+        "role": "PlanningAgent",
+        "overrides": {
+          "model": null,
+          "provider": null,
+          "g4f_params": {}
+        }
+      },
+      "writing": {
+        "role": "WritingAgent",
+        "overrides": {
+          "model": null,
+          "provider": null,
+          "g4f_params": {}
+        }
+      }
+    }
+  },
+  "g4f_defaults": {
+    "max_retries": 2,
+    "stream": false,
+    "image": null,
+    "image_name": null,
+    "ignore_working": false,
+    "ignore_stream": false,
+    "media": null,
+    "modalities": null,
+    "temperature": 0.2,
+    "presence_penalty": null,
+    "frequency_penalty": null,
+    "top_p": null,
+    "max_tokens": null,
+    "stop": null,
+    "api_key": null,
+    "base_url": null,
+    "web_search": null,
+    "proxy": null,
+    "conversation": null,
+    "timeout": null,
+    "stream_timeout": null,
+    "tool_calls": [],
+    "reasoning_effort": null,
+    "logit_bias": null,
+    "audio": null,
+    "response_format": null,
+    "download_media": false,
+    "raw": false,
+    "extra_body": null,
+    "tool_emulation": null,
+    "images": null,
+    "tools": null,
+    "parallel_tool_calls": null,
+    "tool_choice": null,
+    "conversation_id": null,
+    "extra_kwargs": {}
+  }
+}

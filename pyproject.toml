@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "g4fagent"
+version = "0.1.0"
+description = "Agentic scaffolding SDK built on g4f"
+requires-python = ">=3.10"
+dependencies = [
+  "g4f",
+]
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+include = ["g4fagent*", "tools*"]

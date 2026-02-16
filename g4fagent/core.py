@@ -1,0 +1,928 @@
+"""Core SDK primitives for managing agents, stages, pipelines, and G4F calls.
+
+Inputs:
+- Module imports and runtime configuration objects passed into public APIs.
+Output:
+- Class and function APIs for agent/stage/pipeline orchestration and chat execution.
+Example:
+```python
+from g4fagent import G4FManager
+manager = G4FManager.from_config()
+```
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+from .config import load_runtime_config, resolve_pipeline_stages
+from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH, G4F_SUPPORTED_CHAT_PARAMS
+from .utils import clamp, deep_merge_dict, format_template, msg, pretty_json
+
+try:
+    import g4f
+    from g4f.typing import Messages
+except Exception as e:
+    raise ImportError("Failed to import g4f. Install with: pip install g4f") from e
+
+
+@dataclass
+class LLMConfig:
+    """Runtime configuration for low-level chat execution behavior.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - LLMConfig: A configured `LLMConfig` instance.
+    Example:
+    ```python
+    obj = LLMConfig(...)
+    ```
+    """
+
+    max_retries: int = 2
+    log_requests: bool = True
+
+
+def resolve_model_name(name: Optional[str]) -> str:
+    """Resolve a model alias to a concrete g4f model name.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = resolve_model_name(...)
+    ```
+    """
+    if name and name != "default":
+        return str(name)
+    return getattr(g4f.models, "default", None) or "gpt-3.5-turbo"
+
+
+@dataclass
+class Agent:
+    """Represents a single role definition and request-building behavior.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - Agent: A configured `Agent` instance.
+    Example:
+    ```python
+    obj = Agent(...)
+    ```
+    """
+
+    role: str
+    prompt: str
+    user_prompt_template: str
+    model: Optional[str] = None
+    provider: Optional[str] = None
+    description: str = ""
+    g4f_params: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_definition(cls, role: str, definition: Dict[str, Any]) -> "Agent":
+        """Create an agent from a role name and JSON-like definition object.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.from_definition(...)
+        ```
+        """
+        return cls(
+            role=role,
+            prompt=str(definition.get("prompt", "")),
+            user_prompt_template=str(definition.get("user_prompt_template", "")),
+            model=definition.get("model"),
+            provider=definition.get("provider"),
+            description=str(definition.get("description", "")),
+            g4f_params=dict(definition.get("g4f_params", {}) or {}),
+        )
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the agent into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "role": self.role,
+            "prompt": self.prompt,
+            "user_prompt_template": self.user_prompt_template,
+            "model": self.model,
+            "provider": self.provider,
+            "description": self.description,
+            "g4f_params": dict(self.g4f_params),
+        }
+
+    def clone_with(self, **updates: Any) -> "Agent":
+        """Return a copy of this agent with selected fields updated.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.clone_with(...)
+        ```
+        """
+        data = self.to_dict()
+        data.update(updates)
+        return Agent(**data)
+
+    def build_messages(self, template_context: Dict[str, Any]) -> Messages:
+        """Build system/user messages using the agent templates.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_messages(...)
+        ```
+        """
+        return [
+            msg("system", self.prompt),
+            msg("user", format_template(self.user_prompt_template, template_context)),
+        ]
+
+    def build_request(
+        self,
+        defaults: Dict[str, Any],
+        stage_overrides: Dict[str, Any],
+        cli_model: Optional[str],
+        cli_temperature: Optional[float],
+        fallback_retries: int,
+    ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
+        """Build model/provider/kwargs/retry tuple for a chat request.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_request(...)
+        ```
+        """
+        merged_params = deep_merge_dict(defaults, self.g4f_params)
+        merged_params = deep_merge_dict(merged_params, (stage_overrides.get("g4f_params", {}) or {}))
+        if cli_temperature is not None:
+            merged_params["temperature"] = cli_temperature
+
+        max_retries = int(merged_params.pop("max_retries", fallback_retries))
+        extra_kwargs = merged_params.pop("extra_kwargs", {}) or {}
+
+        model_name = cli_model or stage_overrides.get("model") or self.model
+        provider_name = stage_overrides.get("provider", self.provider)
+        resolved_model = resolve_model_name(model_name)
+
+        create_kwargs: Dict[str, Any] = {}
+        for k, v in merged_params.items():
+            if k in G4F_SUPPORTED_CHAT_PARAMS and v is not None:
+                create_kwargs[k] = v
+        if isinstance(extra_kwargs, dict):
+            for k, v in extra_kwargs.items():
+                if v is not None:
+                    create_kwargs[k] = v
+        return resolved_model, provider_name, create_kwargs, max_retries
+
+
+@dataclass
+class Stage:
+    """Represents a pipeline stage and the agents assigned to it.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - Stage: A configured `Stage` instance.
+    Example:
+    ```python
+    obj = Stage(...)
+    ```
+    """
+
+    name: str
+    agents: List[Agent] = field(default_factory=list)
+    overrides: Dict[str, Any] = field(default_factory=dict)
+
+    @classmethod
+    def from_config(
+        cls,
+        name: str,
+        stage_config: Dict[str, Any],
+        agent_lookup: Dict[str, Agent],
+    ) -> "Stage":
+        """Construct a stage from pipeline config and known agents.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.from_config(...)
+        ```
+        """
+        role = stage_config.get("role")
+        roles = stage_config.get("roles")
+        if isinstance(roles, list) and roles:
+            role_names = [str(r) for r in roles]
+        else:
+            role_names = [str(role)] if role else []
+
+        agents: List[Agent] = []
+        for role_name in role_names:
+            agent = agent_lookup.get(role_name)
+            if agent is None:
+                raise KeyError(f"Stage '{name}' references unknown role '{role_name}'")
+            agents.append(agent)
+
+        if not agents:
+            raise ValueError(f"Stage '{name}' must define at least one role/agent")
+
+        return cls(name=name, agents=agents, overrides=dict(stage_config.get("overrides", {}) or {}))
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the stage into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "name": self.name,
+            "roles": [a.role for a in self.agents],
+            "overrides": dict(self.overrides),
+        }
+
+    def list_agent_roles(self) -> List[str]:
+        """Return all role names assigned to this stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.list_agent_roles(...)
+        ```
+        """
+        return [agent.role for agent in self.agents]
+
+    def has_agent(self, role: str) -> bool:
+        """Return whether a role is assigned to this stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.has_agent(...)
+        ```
+        """
+        return any(agent.role == role for agent in self.agents)
+
+    def get_agent(self, role: str) -> Agent:
+        """Return the stage agent for a specific role.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_agent(...)
+        ```
+        """
+        for agent in self.agents:
+            if agent.role == role:
+                return agent
+        raise KeyError(f"Stage '{self.name}' does not include role '{role}'")
+
+    def add_agent(self, agent: Agent) -> None:
+        """Attach an agent to this stage if not already present.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.add_agent(...)
+        ```
+        """
+        if self.has_agent(agent.role):
+            return
+        self.agents.append(agent)
+
+    def primary_agent(self) -> Agent:
+        """Return the primary agent used for stage execution.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.primary_agent(...)
+        ```
+        """
+        if not self.agents:
+            raise ValueError(f"Stage '{self.name}' has no agents")
+        return self.agents[0]
+
+    def role_name(self) -> str:
+        """Return the primary role name for this stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.role_name(...)
+        ```
+        """
+        return self.primary_agent().role
+
+    def provider_label(self) -> Optional[str]:
+        """Return the effective provider label for this stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.provider_label(...)
+        ```
+        """
+        agent = self.primary_agent()
+        return self.overrides.get("provider", agent.provider)
+
+    def model_label(self, cli_model: Optional[str]) -> str:
+        """Return the effective model label for this stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.model_label(...)
+        ```
+        """
+        agent = self.primary_agent()
+        return resolve_model_name(cli_model or self.overrides.get("model") or agent.model)
+
+    def build_messages(self, template_context: Dict[str, Any]) -> Messages:
+        """Build stage messages using the primary agent.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_messages(...)
+        ```
+        """
+        return self.primary_agent().build_messages(template_context)
+
+    def build_request(
+        self,
+        defaults: Dict[str, Any],
+        cli_model: Optional[str],
+        cli_temperature: Optional[float],
+        fallback_retries: int,
+    ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
+        """Build request parameters for the stage's primary agent.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_request(...)
+        ```
+        """
+        return self.primary_agent().build_request(
+            defaults=defaults,
+            stage_overrides=self.overrides,
+            cli_model=cli_model,
+            cli_temperature=cli_temperature,
+            fallback_retries=fallback_retries,
+        )
+
+
+@dataclass
+class Pipeline:
+    """Represents an ordered collection of execution stages.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - Pipeline: A configured `Pipeline` instance.
+    Example:
+    ```python
+    obj = Pipeline(...)
+    ```
+    """
+
+    stages: List[Stage] = field(default_factory=list)
+    order: List[str] = field(default_factory=list)
+
+    @classmethod
+    def from_runtime_config(
+        cls,
+        runtime_cfg: Dict[str, Any],
+        agent_lookup: Dict[str, Agent],
+    ) -> "Pipeline":
+        """Construct a pipeline from runtime config and agent lookup.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.from_runtime_config(...)
+        ```
+        """
+        pipeline_cfg = (runtime_cfg.get("pipeline", {}) or {})
+        stages_cfg = (pipeline_cfg.get("stages", {}) or {})
+        configured_order = pipeline_cfg.get("order", [])
+        if isinstance(configured_order, list):
+            order = [str(s) for s in configured_order if isinstance(s, str) and s]
+        else:
+            order = []
+
+        if not order:
+            order = [str(name) for name in stages_cfg.keys()]
+
+        stages: List[Stage] = []
+        for stage_name in order:
+            stage_cfg = stages_cfg.get(stage_name)
+            if not isinstance(stage_cfg, dict):
+                raise KeyError(f"Missing stage config for '{stage_name}'")
+            stages.append(Stage.from_config(stage_name, stage_cfg, agent_lookup))
+
+        return cls(stages=stages, order=order)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the pipeline into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "order": list(self.order),
+            "stages": [stage.to_dict() for stage in self.stages],
+        }
+
+    def list_stage_names(self) -> List[str]:
+        """Return stage names in execution order.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.list_stage_names(...)
+        ```
+        """
+        return [stage.name for stage in self.stages]
+
+    def has_stage(self, stage_name: str) -> bool:
+        """Return whether a stage exists in this pipeline.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.has_stage(...)
+        ```
+        """
+        return any(stage.name == stage_name for stage in self.stages)
+
+    def get_stage(self, stage_name: str) -> Stage:
+        """Return a stage by name.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_stage(...)
+        ```
+        """
+        for stage in self.stages:
+            if stage.name == stage_name:
+                return stage
+        raise KeyError(f"Unknown stage: {stage_name}")
+
+    def add_stage(self, stage: Stage) -> None:
+        """Append a new stage to the pipeline if not already present.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.add_stage(...)
+        ```
+        """
+        if self.has_stage(stage.name):
+            return
+        self.stages.append(stage)
+        self.order.append(stage.name)
+
+
+class G4FManager:
+    """Primary SDK interface for agent/pipeline-aware g4f interactions.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - G4FManager: A configured `G4FManager` instance.
+    Example:
+    ```python
+    obj = G4FManager(...)
+    ```
+    """
+
+    def __init__(self, runtime_cfg: Dict[str, Any], cfg: Optional[LLMConfig] = None):
+        """Initialize the manager from resolved runtime configuration.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        value = instance.__init__(...)
+        ```
+        """
+        self.runtime_cfg = runtime_cfg
+        default_retries = int((runtime_cfg.get("g4f_defaults", {}) or {}).get("max_retries", 2))
+        self.cfg = cfg or LLMConfig(max_retries=default_retries)
+
+        loaded_agents = (runtime_cfg.get("loaded_agents", {}) or {})
+        self.agents: List[Agent] = [
+            Agent.from_definition(str(role), definition)
+            for role, definition in loaded_agents.items()
+            if isinstance(definition, dict)
+        ]
+        self._agents_by_role: Dict[str, Agent] = {agent.role: agent for agent in self.agents}
+        self.pipeline = Pipeline.from_runtime_config(runtime_cfg, self._agents_by_role)
+
+    @classmethod
+    def from_runtime_config(cls, runtime_cfg: Dict[str, Any], cfg: Optional[LLMConfig] = None) -> "G4FManager":
+        """Create a manager from an in-memory runtime config object.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.from_runtime_config(...)
+        ```
+        """
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg)
+
+    @classmethod
+    def from_config(
+        cls,
+        config_rel_path: str = DEFAULT_CONFIG_REL_PATH,
+        base_dir: Path = APP_ROOT,
+        cfg: Optional[LLMConfig] = None,
+    ) -> "G4FManager":
+        """Load configuration from disk and build a manager instance.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.from_config(...)
+        ```
+        """
+        runtime_cfg = load_runtime_config(base_dir, config_rel_path)
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize manager state to a dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "agents": [agent.to_dict() for agent in self.agents],
+            "pipeline": self.pipeline.to_dict(),
+            "meta": dict((self.runtime_cfg.get("_meta", {}) or {})),
+        }
+
+    def get_runtime_config(self) -> Dict[str, Any]:
+        """Return the runtime configuration backing this manager.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_runtime_config(...)
+        ```
+        """
+        return self.runtime_cfg
+
+    def metadata(self) -> Dict[str, Any]:
+        """Return config metadata such as resolved config and agent paths.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.metadata(...)
+        ```
+        """
+        return dict((self.runtime_cfg.get("_meta", {}) or {}))
+
+    def list_agents(self) -> List[str]:
+        """Return role names for all registered agents.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.list_agents(...)
+        ```
+        """
+        return [agent.role for agent in self.agents]
+
+    def get_agent(self, role: str) -> Agent:
+        """Return an agent by role name.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_agent(...)
+        ```
+        """
+        agent = self._agents_by_role.get(role)
+        if agent is None:
+            raise KeyError(f"Unknown agent role: {role}")
+        return agent
+
+    def list_stages(self) -> List[str]:
+        """Return pipeline stage names in execution order.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.list_stages(...)
+        ```
+        """
+        return self.pipeline.list_stage_names()
+
+    def get_stage(self, stage_name: str) -> Stage:
+        """Return a stage from the pipeline by name.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_stage(...)
+        ```
+        """
+        return self.pipeline.get_stage(stage_name)
+
+    def default_stage_names(self) -> Tuple[str, str]:
+        """Return default planning and writing stage names.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.default_stage_names(...)
+        ```
+        """
+        return resolve_pipeline_stages(self.runtime_cfg)
+
+    def stage_role_name(self, stage_name: str) -> str:
+        """Return the primary role name used by a stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.stage_role_name(...)
+        ```
+        """
+        return self.get_stage(stage_name).role_name()
+
+    def stage_model_label(self, stage_name: str, cli_model: Optional[str]) -> str:
+        """Return the effective model label for a stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.stage_model_label(...)
+        ```
+        """
+        return self.get_stage(stage_name).model_label(cli_model)
+
+    def stage_provider_label(self, stage_name: str) -> Optional[str]:
+        """Return the effective provider label for a stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.stage_provider_label(...)
+        ```
+        """
+        return self.get_stage(stage_name).provider_label()
+
+    def build_stage_messages(self, stage_name: str, template_context: Dict[str, Any]) -> Messages:
+        """Build templated messages for a stage.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_stage_messages(...)
+        ```
+        """
+        return self.get_stage(stage_name).build_messages(template_context)
+
+    def build_stage_request(
+        self,
+        stage_name: str,
+        cli_model: Optional[str],
+        cli_temperature: Optional[float],
+    ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
+        """Build request parameters for a stage execution.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.build_stage_request(...)
+        ```
+        """
+        return self.get_stage(stage_name).build_request(
+            defaults=(self.runtime_cfg.get("g4f_defaults", {}) or {}),
+            cli_model=cli_model,
+            cli_temperature=cli_temperature,
+            fallback_retries=self.cfg.max_retries,
+        )
+
+    def chat(
+        self,
+        messages: Messages,
+        model: str,
+        provider: Optional[str] = None,
+        create_kwargs: Optional[Dict[str, Any]] = None,
+        max_retries: Optional[int] = None,
+    ) -> str:
+        """Execute a raw chat completion call through g4f.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.chat(...)
+        ```
+        """
+        create_kwargs = create_kwargs or {}
+        retries = max_retries if max_retries is not None else self.cfg.max_retries
+        last_err = None
+        if self.cfg.log_requests:
+            print(f"Calling G4F model: {model} (provider={provider or 'auto'}, max_retries={retries})")
+            print(f"Messages (truncated):\n{clamp(pretty_json(messages), 2000)}")
+
+        for attempt in range(1, retries + 2):
+            try:
+                resp = g4f.ChatCompletion.create(
+                    model=model,
+                    messages=messages,
+                    provider=provider,
+                    **create_kwargs,
+                )
+                if isinstance(resp, str):
+                    return resp
+                if isinstance(resp, dict):
+                    try:
+                        return resp["choices"][0]["message"]["content"]
+                    except Exception:
+                        return str(resp)
+                return str(resp)
+            except Exception as e:
+                last_err = e
+                if attempt <= retries + 1:
+                    continue
+        raise RuntimeError(f"G4F call failed: {last_err}")
+
+    def chat_stage(
+        self,
+        stage_name: str,
+        template_context: Dict[str, Any],
+        cli_model: Optional[str] = None,
+        cli_temperature: Optional[float] = None,
+    ) -> str:
+        """Execute a stage by building messages/request settings and chatting.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.chat_stage(...)
+        ```
+        """
+        messages = self.build_stage_messages(stage_name, template_context)
+        model, provider, create_kwargs, max_retries = self.build_stage_request(
+            stage_name=stage_name,
+            cli_model=cli_model,
+            cli_temperature=cli_temperature,
+        )
+        return self.chat(
+            messages=messages,
+            model=model,
+            provider=provider,
+            create_kwargs=create_kwargs,
+            max_retries=max_retries,
+        )
