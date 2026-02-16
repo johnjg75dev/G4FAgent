@@ -13,12 +13,13 @@ manager = G4FManager.from_config()
 
 from __future__ import annotations
 
+import re
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from .config import load_runtime_config, resolve_pipeline_stages
 from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH, G4F_SUPPORTED_CHAT_PARAMS
@@ -37,6 +38,23 @@ try:
     from g4f.typing import Messages
 except Exception as e:
     raise ImportError("Failed to import g4f. Install with: pip install g4f") from e
+
+SCAN_TEXT_ERROR_PATTERNS = [
+    re.compile(r'add a\s+["\']?api[_-]?key["\']?', re.IGNORECASE),
+    re.compile(r"missing\s+api[_-]?key", re.IGNORECASE),
+    re.compile(r"invalidrepotoken", re.IGNORECASE),
+    re.compile(r"falling back to ip-based quotas", re.IGNORECASE),
+]
+
+PROVIDER_META_CLASS_NAMES = {
+    "BaseProvider",
+    "RetryProvider",
+    "IterListProvider",
+    "RotatedProvider",
+    "AsyncProvider",
+    "AsyncGeneratorProvider",
+    "CreateImagesProvider",
+}
 
 
 @dataclass
@@ -225,6 +243,151 @@ def list_known_model_names(include_defaults: bool = True) -> List[str]:
     return sorted(names)
 
 
+def _normalize_provider_token(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(value).strip().lower())
+
+
+def _provider_name_from_value(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        provider_name = value.strip()
+        return provider_name or None
+    if isinstance(value, type):
+        provider_name = getattr(value, "__name__", "")
+        provider_name = str(provider_name).strip()
+        return provider_name or None
+    provider_name = getattr(value, "__name__", None)
+    if isinstance(provider_name, str) and provider_name.strip():
+        return provider_name.strip()
+    class_name = getattr(getattr(value, "__class__", None), "__name__", "")
+    class_name = str(class_name).strip()
+    return class_name or None
+
+
+def _collect_provider_names(value: Any, sink: List[str]) -> None:
+    if value is None:
+        return
+    if isinstance(value, (list, tuple, set)):
+        for item in value:
+            _collect_provider_names(item, sink)
+        return
+
+    provider_name = _provider_name_from_value(value)
+    if provider_name and provider_name not in PROVIDER_META_CLASS_NAMES:
+        sink.append(provider_name)
+
+    nested = getattr(value, "providers", None)
+    if nested is not None:
+        _collect_provider_names(nested, sink)
+
+
+def list_known_provider_names(include_meta: bool = False) -> List[str]:
+    """Return provider class names discovered from `g4f.Provider`.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = list_known_provider_names(...)
+    ```
+    """
+    provider_module = getattr(g4f, "Provider", None)
+    if provider_module is None:
+        return []
+    base_cls = getattr(provider_module, "BaseProvider", None)
+
+    names: List[str] = []
+    for attr_name, attr_value in vars(provider_module).items():
+        if attr_name.startswith("_"):
+            continue
+        if not isinstance(attr_value, type):
+            continue
+        class_name = str(getattr(attr_value, "__name__", attr_name)).strip() or attr_name
+        if base_cls is not None:
+            try:
+                if not issubclass(attr_value, base_cls):
+                    continue
+            except Exception:
+                continue
+        if not include_meta and class_name in PROVIDER_META_CLASS_NAMES:
+            continue
+        if not include_meta and not hasattr(attr_value, "working"):
+            continue
+        names.append(class_name)
+    return sorted(set(names))
+
+
+def resolve_provider_name(name: Optional[str]) -> Optional[str]:
+    """Resolve a provider name/alias into the canonical g4f provider class name.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = resolve_provider_name(...)
+    ```
+    """
+    raw = str(name or "").strip()
+    if not raw:
+        return None
+    target = _normalize_provider_token(raw)
+    if not target:
+        return None
+
+    for provider_name in list_known_provider_names(include_meta=False):
+        if _normalize_provider_token(provider_name) == target:
+            return provider_name
+    return None
+
+
+def list_known_model_names_for_provider(
+    provider: str,
+    *,
+    include_defaults: bool = True,
+) -> List[str]:
+    """Return model aliases whose declared provider set includes `provider`.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = list_known_model_names_for_provider(...)
+    ```
+    """
+    resolved_provider = resolve_provider_name(provider)
+    if not resolved_provider:
+        return []
+    target = _normalize_provider_token(resolved_provider)
+
+    model_cls = getattr(g4f.models, "Model", None)
+    if model_cls is None:
+        return []
+
+    matched: List[str] = []
+    for alias, model_obj in vars(g4f.models).items():
+        if alias.startswith("_"):
+            continue
+        if not isinstance(model_obj, model_cls):
+            continue
+        if not include_defaults and alias.startswith("default"):
+            continue
+
+        provider_names: List[str] = []
+        _collect_provider_names(getattr(model_obj, "best_provider", None), provider_names)
+        _collect_provider_names(getattr(model_obj, "providers", None), provider_names)
+        _collect_provider_names(getattr(model_obj, "provider", None), provider_names)
+        if any(_normalize_provider_token(name) == target for name in provider_names):
+            matched.append(alias)
+    return sorted(matched)
+
+
 @dataclass
 class ModelScanResult:
     """Represents one model probe outcome from a model-availability scan.
@@ -243,6 +406,7 @@ class ModelScanResult:
     ok: bool
     status: str
     elapsed_seconds: float
+    provider: str = "auto"
     response_preview: str = ""
     error: Optional[str] = None
 
@@ -260,6 +424,8 @@ class ModelScanResult:
         """
         return {
             "model": self.model,
+            "provider": self.provider,
+            "provider_model": f"{self.provider}/{self.model}",
             "ok": self.ok,
             "status": self.status,
             "elapsed_seconds": self.elapsed_seconds,
@@ -290,6 +456,8 @@ class ModelScanSummary:
     delay_seconds: float
     parallel: bool
     max_workers: int
+    stopped: bool = False
+    stop_reason: Optional[str] = None
     results: List[ModelScanResult] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -306,6 +474,8 @@ class ModelScanSummary:
         """
         working = [r.model for r in self.results if r.ok]
         failing = [r.model for r in self.results if not r.ok]
+        working_provider_models = [f"{r.provider}/{r.model}" for r in self.results if r.ok]
+        failing_provider_models = [f"{r.provider}/{r.model}" for r in self.results if not r.ok]
         no_response = [r for r in self.results if r.status == "no_response"]
         errors = [r for r in self.results if r.status == "error"]
         return {
@@ -317,6 +487,8 @@ class ModelScanSummary:
             "delay_seconds": self.delay_seconds,
             "parallel": self.parallel,
             "max_workers": self.max_workers,
+            "stopped": self.stopped,
+            "stop_reason": self.stop_reason,
             "total": len(self.results),
             "ok_count": len(working),
             "failed_count": len(failing),
@@ -324,6 +496,8 @@ class ModelScanSummary:
             "error_count": len(errors),
             "working_models": working,
             "failing_models": failing,
+            "working_provider_models": working_provider_models,
+            "failing_provider_models": failing_provider_models,
             "results": [r.to_dict() for r in self.results],
         }
 
@@ -344,6 +518,43 @@ def _resolve_scan_target(model: Any) -> Tuple[str, Any]:
     return str(model), model
 
 
+def _provider_label(provider_value: Any) -> str:
+    if provider_value is None:
+        return "auto"
+    if isinstance(provider_value, str):
+        provider_name = provider_value.strip()
+        return provider_name or "auto"
+    provider_name = getattr(provider_value, "__name__", None)
+    if isinstance(provider_name, str) and provider_name.strip():
+        return provider_name.strip()
+    return str(provider_value)
+
+
+def _resolve_scan_spec(raw_model: Any, default_provider: Optional[str]) -> Tuple[str, Any, Any, str]:
+    provider_value: Any = default_provider
+    model_spec = raw_model
+
+    if isinstance(raw_model, dict):
+        model_spec = raw_model.get("model", raw_model.get("name"))
+        provider_value = raw_model.get("provider", default_provider)
+    elif isinstance(raw_model, (tuple, list)) and len(raw_model) == 2:
+        model_spec = raw_model[0]
+        provider_value = raw_model[1]
+
+    label, target = _resolve_scan_target(model_spec)
+    return label, target, provider_value, _provider_label(provider_value)
+
+
+def _scan_response_error_text(text: str) -> Optional[str]:
+    probe = (text or "").strip()
+    if not probe:
+        return None
+    for pattern in SCAN_TEXT_ERROR_PATTERNS:
+        if pattern.search(probe):
+            return probe
+    return None
+
+
 def scan_models(
     models: Optional[List[Any]] = None,
     *,
@@ -354,6 +565,8 @@ def scan_models(
     parallel: bool = False,
     max_workers: int = 4,
     response_preview_chars: int = 180,
+    on_result: Optional[Callable[[ModelScanResult], None]] = None,
+    stop_requested: Optional[Callable[[], bool]] = None,
 ) -> ModelScanSummary:
     """Probe models with a lightweight prompt and classify success/failure.
     
@@ -367,12 +580,12 @@ def scan_models(
     ```
     """
     raw_targets = list(models) if models is not None else list_known_model_names(include_defaults=True)
-    targets: List[Tuple[int, str, Any]] = []
+    targets: List[Tuple[int, str, Any, Any, str]] = []
     for raw in raw_targets:
-        label, target = _resolve_scan_target(raw)
+        label, target, provider_value, provider_name = _resolve_scan_spec(raw, provider)
         if not label:
             continue
-        targets.append((len(targets), label, target))
+        targets.append((len(targets), label, target, provider_value, provider_name))
 
     scan_prompt = (prompt or "").strip() or "Reply with exactly: OK"
     sanitized_kwargs = {k: v for k, v in (create_kwargs or {}).items() if v is not None}
@@ -382,8 +595,33 @@ def scan_models(
     workers = max(1, int(max_workers))
     started_at = now_iso()
     started_monotonic = time.monotonic()
+    stopped = False
+    stop_reason: Optional[str] = None
 
-    def run_single(idx: int, label: str, model_value: Any) -> Tuple[int, ModelScanResult]:
+    def should_stop() -> bool:
+        if stop_requested is None:
+            return False
+        try:
+            return bool(stop_requested())
+        except Exception:
+            return False
+
+    def emit_result(result: ModelScanResult) -> None:
+        if on_result is None:
+            return
+        try:
+            on_result(result)
+        except Exception:
+            # Ignore callback failures so scans continue and summaries are returned.
+            return
+
+    def run_single(
+        idx: int,
+        label: str,
+        model_value: Any,
+        provider_value: Any,
+        provider_name: str,
+    ) -> Tuple[int, ModelScanResult]:
         if delay > 0:
             scheduled_start = started_monotonic + (idx * delay)
             wait = scheduled_start - time.monotonic()
@@ -395,7 +633,7 @@ def scan_models(
             response = g4f.ChatCompletion.create(
                 model=model_value,
                 messages=base_messages,
-                provider=provider,
+                provider=provider_value,
                 **sanitized_kwargs,
             )
             text = _coerce_chat_response_text(response).strip()
@@ -405,16 +643,31 @@ def scan_models(
                     idx,
                     ModelScanResult(
                         model=label,
+                        provider=provider_name,
                         ok=False,
                         status="no_response",
                         elapsed_seconds=elapsed,
                         error="No response content returned.",
                     ),
                 )
+            response_error = _scan_response_error_text(text)
+            if response_error is not None:
+                return (
+                    idx,
+                    ModelScanResult(
+                        model=label,
+                        provider=provider_name,
+                        ok=False,
+                        status="error",
+                        elapsed_seconds=elapsed,
+                        error=clamp(response_error, response_preview_chars),
+                    ),
+                )
             return (
                 idx,
                 ModelScanResult(
                     model=label,
+                    provider=provider_name,
                     ok=True,
                     status="ok",
                     elapsed_seconds=elapsed,
@@ -427,6 +680,7 @@ def scan_models(
                 idx,
                 ModelScanResult(
                     model=label,
+                    provider=provider_name,
                     ok=False,
                     status="error",
                     elapsed_seconds=elapsed,
@@ -437,16 +691,68 @@ def scan_models(
     indexed_results: List[Tuple[int, ModelScanResult]] = []
     use_parallel = bool(parallel and workers > 1 and len(targets) > 1)
     if use_parallel:
-        with ThreadPoolExecutor(max_workers=workers) as pool:
-            future_map = {
-                pool.submit(run_single, idx, label, model_value): idx
-                for idx, label, model_value in targets
-            }
-            for fut in as_completed(future_map):
-                indexed_results.append(fut.result())
+        pool = ThreadPoolExecutor(max_workers=workers)
+        try:
+            future_map = {}
+            target_iter = iter(targets)
+
+            def submit_next() -> bool:
+                nonlocal stopped, stop_reason
+                if should_stop():
+                    stopped = True
+                    stop_reason = "stop_requested"
+                    return False
+                try:
+                    idx, label, model_value, provider_value, provider_name = next(target_iter)
+                except StopIteration:
+                    return False
+                future_map[pool.submit(run_single, idx, label, model_value, provider_value, provider_name)] = idx
+                return True
+
+            for _ in range(workers):
+                if not submit_next():
+                    break
+
+            while future_map:
+                if should_stop():
+                    stopped = True
+                    stop_reason = "stop_requested"
+                    break
+
+                done, _ = wait(set(future_map.keys()), timeout=0.1, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for fut in done:
+                    _ = future_map.pop(fut, None)
+                    result = fut.result()
+                    indexed_results.append(result)
+                    emit_result(result[1])
+
+                while len(future_map) < workers:
+                    if not submit_next():
+                        break
+
+            if stopped:
+                for fut in list(future_map.keys()):
+                    fut.cancel()
+        finally:
+            if stopped:
+                try:
+                    pool.shutdown(wait=False, cancel_futures=True)
+                except TypeError:
+                    pool.shutdown(wait=False)
+            else:
+                pool.shutdown(wait=True)
     else:
-        for idx, label, model_value in targets:
-            indexed_results.append(run_single(idx, label, model_value))
+        for idx, label, model_value, provider_value, provider_name in targets:
+            if should_stop():
+                stopped = True
+                stop_reason = "stop_requested"
+                break
+            result = run_single(idx, label, model_value, provider_value, provider_name)
+            indexed_results.append(result)
+            emit_result(result[1])
 
     indexed_results.sort(key=lambda item: item[0])
     results = [item[1] for item in indexed_results]
@@ -461,6 +767,8 @@ def scan_models(
         delay_seconds=delay,
         parallel=use_parallel,
         max_workers=workers,
+        stopped=stopped,
+        stop_reason=stop_reason,
         results=results,
     )
 
@@ -836,6 +1144,7 @@ class Agent:
         defaults: Dict[str, Any],
         stage_overrides: Dict[str, Any],
         cli_model: Optional[str],
+        cli_provider: Optional[str],
         cli_temperature: Optional[float],
         fallback_retries: int,
     ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
@@ -859,7 +1168,7 @@ class Agent:
         extra_kwargs = merged_params.pop("extra_kwargs", {}) or {}
 
         model_name = cli_model or stage_overrides.get("model") or self.model
-        provider_name = stage_overrides.get("provider", self.provider)
+        provider_name = cli_provider or stage_overrides.get("provider", self.provider)
         resolved_model = resolve_model_name(model_name)
 
         create_kwargs: Dict[str, Any] = {}
@@ -1089,6 +1398,7 @@ class Stage:
         self,
         defaults: Dict[str, Any],
         cli_model: Optional[str],
+        cli_provider: Optional[str],
         cli_temperature: Optional[float],
         fallback_retries: int,
     ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
@@ -1107,6 +1417,7 @@ class Stage:
             defaults=defaults,
             stage_overrides=self.overrides,
             cli_model=cli_model,
+            cli_provider=cli_provider,
             cli_temperature=cli_temperature,
             fallback_retries=fallback_retries,
         )
@@ -1526,6 +1837,7 @@ class G4FManager:
         self,
         stage_name: str,
         cli_model: Optional[str],
+        cli_provider: Optional[str],
         cli_temperature: Optional[float],
     ) -> Tuple[str, Optional[str], Dict[str, Any], int]:
         """Build request parameters for a stage execution.
@@ -1542,6 +1854,7 @@ class G4FManager:
         return self.get_stage(stage_name).build_request(
             defaults=(self.runtime_cfg.get("g4f_defaults", {}) or {}),
             cli_model=cli_model,
+            cli_provider=cli_provider,
             cli_temperature=cli_temperature,
             fallback_retries=self.cfg.max_retries,
         )
@@ -1557,6 +1870,8 @@ class G4FManager:
         parallel: bool = False,
         max_workers: int = 4,
         response_preview_chars: int = 180,
+        on_result: Optional[Callable[[ModelScanResult], None]] = None,
+        stop_requested: Optional[Callable[[], bool]] = None,
     ) -> ModelScanSummary:
         """Run model availability probing using runtime defaults plus overrides.
         
@@ -1611,6 +1926,8 @@ class G4FManager:
             parallel=parallel,
             max_workers=max_workers,
             response_preview_chars=response_preview_chars,
+            on_result=on_result,
+            stop_requested=stop_requested,
         )
 
     def detect_verification_program_paths(
@@ -1720,6 +2037,7 @@ class G4FManager:
         stage_name: str,
         template_context: Dict[str, Any],
         cli_model: Optional[str] = None,
+        cli_provider: Optional[str] = None,
         cli_temperature: Optional[float] = None,
         image: Any = None,
         image_name: Optional[str] = None,
@@ -1742,6 +2060,7 @@ class G4FManager:
         model, provider, create_kwargs, max_retries = self.build_stage_request(
             stage_name=stage_name,
             cli_model=cli_model,
+            cli_provider=cli_provider,
             cli_temperature=cli_temperature,
         )
         response = self.chat(

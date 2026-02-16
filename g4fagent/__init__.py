@@ -12,7 +12,15 @@ manager = G4FManager.from_config()
 """
 
 from .core import Agent, G4FManager, LLMConfig, Pipeline, Project, ProjectFile, Stage, resolve_model_name
-from .core import ModelScanResult, ModelScanSummary, list_known_model_names, scan_models
+from .core import (
+    ModelScanResult,
+    ModelScanSummary,
+    list_known_model_names,
+    list_known_model_names_for_provider,
+    list_known_provider_names,
+    resolve_provider_name,
+    scan_models,
+)
 from .utils import detect_verification_program_paths
 
 __all__ = [
@@ -24,7 +32,10 @@ __all__ = [
     "LLMConfig",
     "G4FManager",
     "resolve_model_name",
+    "resolve_provider_name",
     "list_known_model_names",
+    "list_known_provider_names",
+    "list_known_model_names_for_provider",
     "scan_models",
     "ModelScanResult",
     "ModelScanSummary",

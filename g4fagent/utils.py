@@ -644,18 +644,45 @@ def parse_tool_call(text: str) -> Optional[Dict[str, Any]]:
     result = parse_tool_call(...)
     ```
     """
-    text = text.strip()
-    if not (text.startswith("{") and text.endswith("}")):
+    raw = str(text or "")
+    stripped = raw.strip()
+    if not stripped:
         return None
+
+    def validate_tool_envelope(obj: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(obj, dict):
+            return None
+        if "tool" not in obj or "args" not in obj:
+            return None
+        if not isinstance(obj.get("tool"), str):
+            return None
+        if not isinstance(obj.get("args"), dict):
+            return None
+        return obj
+
+    # Fast path for strict single-object responses.
     try:
-        obj = json.loads(text)
+        parsed = json.loads(stripped)
     except Exception:
-        return None
-    if not isinstance(obj, dict):
-        return None
-    if "tool" not in obj or "args" not in obj:
-        return None
-    return obj
+        parsed = None
+    validated = validate_tool_envelope(parsed)
+    if validated is not None:
+        return validated
+
+    # Fallback: detect and parse the first JSON object in mixed text.
+    decoder = json.JSONDecoder()
+    for source in (stripped, raw):
+        for idx, ch in enumerate(source):
+            if ch != "{":
+                continue
+            try:
+                obj, _ = decoder.raw_decode(source[idx:])
+            except Exception:
+                continue
+            validated = validate_tool_envelope(obj)
+            if validated is not None:
+                return validated
+    return None
 
 
 def show_tree(root: Path) -> str:

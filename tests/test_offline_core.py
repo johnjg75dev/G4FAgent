@@ -12,9 +12,12 @@ from g4fagent.core import (
     Project,
     Stage,
     enforce_strict_json_object_response_format,
+    list_known_model_names_for_provider,
     list_known_model_names,
+    list_known_provider_names,
     merge_prompt_media_kwargs,
     resolve_model_name,
+    resolve_provider_name,
     scan_models,
 )
 from g4fagent.utils import msg
@@ -116,6 +119,7 @@ class TestAgentStagePipeline(unittest.TestCase):
             defaults={"stream": False, "stop": None},
             stage_overrides={"model": "m1", "provider": "p1", "g4f_params": {"top_p": 0.7}},
             cli_model=None,
+            cli_provider=None,
             cli_temperature=0.3,
             fallback_retries=2,
         )
@@ -128,6 +132,18 @@ class TestAgentStagePipeline(unittest.TestCase):
         self.assertEqual(kwargs["custom_key"], "ok")
         self.assertNotIn("unknown_param", kwargs)
         self.assertEqual(kwargs["response_format"]["type"], "json_schema")
+
+    def test_agent_build_request_cli_provider_override(self) -> None:
+        agent = Agent(role="R", prompt="P", user_prompt_template="T", provider="base-provider")
+        _, provider, _, _ = agent.build_request(
+            defaults={},
+            stage_overrides={"provider": "stage-provider"},
+            cli_model="m1",
+            cli_provider="cli-provider",
+            cli_temperature=None,
+            fallback_retries=1,
+        )
+        self.assertEqual(provider, "cli-provider")
 
     def test_stage_from_config_validations(self) -> None:
         known = {"R": Agent(role="R", prompt="", user_prompt_template="")}
@@ -200,6 +216,13 @@ class TestManagerChat(unittest.TestCase):
         self.assertEqual(call_kwargs["image"], "https://example.com/img.png")
         self.assertEqual(call_kwargs["image_name"], "img.png")
 
+    @patch("g4fagent.core.Stage.build_request")
+    def test_build_stage_request_forwards_cli_provider(self, build_mock) -> None:
+        build_mock.return_value = ("m", "p", {}, 0)
+        _ = self.manager.build_stage_request("planning", "m", "provider-override", 0.1)
+        kwargs = build_mock.call_args.kwargs
+        self.assertEqual(kwargs["cli_provider"], "provider-override")
+
 
 class TestModelScanner(unittest.TestCase):
     @patch("g4fagent.core.g4f.ChatCompletion.create")
@@ -224,6 +247,9 @@ class TestModelScanner(unittest.TestCase):
         self.assertEqual(serialized["ok_count"], 1)
         self.assertEqual(serialized["no_response_count"], 1)
         self.assertEqual(serialized["error_count"], 1)
+        self.assertIn("provider", serialized["results"][0])
+        self.assertIn("provider_model", serialized["results"][0])
+        self.assertIn("working_provider_models", serialized)
 
     @patch("g4fagent.core.g4f.ChatCompletion.create")
     def test_scan_models_parallel_mode(self, create_mock) -> None:
@@ -239,6 +265,94 @@ class TestModelScanner(unittest.TestCase):
         self.assertEqual(serialized["ok_count"], 4)
         self.assertEqual(create_mock.call_count, 4)
 
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_supports_per_model_provider_overrides(self, create_mock) -> None:
+        create_mock.return_value = "OK"
+        summary = scan_models(
+            models=[
+                {"model": "same-model", "provider": "ProviderA"},
+                {"model": "same-model", "provider": "ProviderB"},
+            ],
+            parallel=False,
+            delay_seconds=0,
+        )
+        serialized = summary.to_dict()
+        provider_models = [item["provider_model"] for item in serialized["results"]]
+        self.assertEqual(provider_models, ["ProviderA/same-model", "ProviderB/same-model"])
+        called_providers = [call.kwargs.get("provider") for call in create_mock.call_args_list]
+        self.assertEqual(called_providers, ["ProviderA", "ProviderB"])
+
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_classifies_provider_error_text_as_error(self, create_mock) -> None:
+        def side_effect(*args, **kwargs):
+            model_value = kwargs.get("model")
+            model_name = str(getattr(model_value, "name", model_value)).strip().lower()
+            if model_name == "flux":
+                return "Falling back to IP-based quotas (InvalidRepoToken)"
+            return "OK"
+
+        create_mock.side_effect = side_effect
+        summary = scan_models(
+            models=["flux", "good-model"],
+            parallel=False,
+            delay_seconds=0,
+        )
+        serialized = summary.to_dict()
+        self.assertEqual(serialized["ok_count"], 1)
+        self.assertEqual(serialized["error_count"], 1)
+        flux = next(item for item in serialized["results"] if item["model"] == "flux")
+        self.assertEqual(flux["status"], "error")
+        self.assertIn("InvalidRepoToken", str(flux["error"]))
+
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_streams_results_via_callback(self, create_mock) -> None:
+        create_mock.return_value = "OK"
+        streamed: list[str] = []
+
+        def on_result(item) -> None:
+            streamed.append(item.model)
+
+        summary = scan_models(
+            models=["m1", "m2", "m3"],
+            parallel=False,
+            delay_seconds=0,
+            on_result=on_result,
+        )
+        self.assertEqual(len(summary.results), 3)
+        self.assertEqual(len(streamed), 3)
+        self.assertEqual(summary.to_dict()["stopped"], False)
+
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_stop_requested_returns_partial_results(self, create_mock) -> None:
+        create_mock.return_value = "OK"
+
+        summary = scan_models(
+            models=["m1", "m2", "m3", "m4"],
+            parallel=False,
+            delay_seconds=0,
+            stop_requested=lambda: create_mock.call_count >= 2,
+        )
+        serialized = summary.to_dict()
+        self.assertEqual(serialized["total"], 2)
+        self.assertEqual(create_mock.call_count, 2)
+        self.assertEqual(serialized["stopped"], True)
+        self.assertEqual(serialized["stop_reason"], "stop_requested")
+
+    @patch("g4fagent.core.g4f.ChatCompletion.create")
+    def test_scan_models_parallel_immediate_stop_makes_no_calls(self, create_mock) -> None:
+        summary = scan_models(
+            models=["m1", "m2", "m3", "m4"],
+            parallel=True,
+            max_workers=2,
+            delay_seconds=0,
+            stop_requested=lambda: True,
+        )
+        serialized = summary.to_dict()
+        self.assertEqual(serialized["total"], 0)
+        self.assertEqual(serialized["stopped"], True)
+        self.assertEqual(serialized["stop_reason"], "stop_requested")
+        self.assertEqual(create_mock.call_count, 0)
+
     @patch("g4fagent.core.g4f.models", create=True)
     def test_list_known_model_names_returns_sorted_aliases(self, mock_models) -> None:
         class FakeModel:
@@ -251,6 +365,76 @@ class TestModelScanner(unittest.TestCase):
 
         result = list_known_model_names(include_defaults=False)
         self.assertEqual(result, ["alpha", "zed"])
+
+    @patch("g4fagent.core.g4f", create=True)
+    def test_list_known_provider_names_and_resolve_provider(self, mock_g4f) -> None:
+        class BaseProvider:
+            pass
+
+        class RetryProvider(BaseProvider):
+            working = False
+
+        class AlphaProvider(BaseProvider):
+            working = True
+
+        class BetaProvider(BaseProvider):
+            working = True
+
+        provider_module = type("ProviderModule", (), {})()
+        provider_module.BaseProvider = BaseProvider
+        provider_module.RetryProvider = RetryProvider
+        provider_module.AlphaProvider = AlphaProvider
+        provider_module.BetaProvider = BetaProvider
+        mock_g4f.Provider = provider_module
+
+        providers = list_known_provider_names(include_meta=False)
+        self.assertEqual(providers, ["AlphaProvider", "BetaProvider"])
+        self.assertEqual(resolve_provider_name("alpha_provider"), "AlphaProvider")
+        self.assertIsNone(resolve_provider_name("missing-provider"))
+
+    @patch("g4fagent.core.g4f", create=True)
+    def test_list_known_model_names_for_provider(self, mock_g4f) -> None:
+        class BaseProvider:
+            pass
+
+        class RetryProvider(BaseProvider):
+            working = False
+
+        class AlphaProvider(BaseProvider):
+            working = True
+
+        class BetaProvider(BaseProvider):
+            working = True
+
+        class IterListProvider(BaseProvider):
+            working = False
+
+            def __init__(self, providers):
+                self.providers = providers
+
+        provider_module = type("ProviderModule", (), {})()
+        provider_module.BaseProvider = BaseProvider
+        provider_module.RetryProvider = RetryProvider
+        provider_module.IterListProvider = IterListProvider
+        provider_module.AlphaProvider = AlphaProvider
+        provider_module.BetaProvider = BetaProvider
+        mock_g4f.Provider = provider_module
+
+        class FakeModel:
+            def __init__(self, best_provider):
+                self.best_provider = best_provider
+
+        models_module = type("ModelsModule", (), {})()
+        models_module.Model = FakeModel
+        models_module.model_a = FakeModel(AlphaProvider)
+        models_module.model_b = FakeModel(IterListProvider([BetaProvider]))
+        models_module.default = FakeModel(IterListProvider([AlphaProvider]))
+        mock_g4f.models = models_module
+
+        alpha_models = list_known_model_names_for_provider("AlphaProvider", include_defaults=False)
+        beta_models = list_known_model_names_for_provider("betaprovider", include_defaults=True)
+        self.assertEqual(alpha_models, ["model_a"])
+        self.assertEqual(beta_models, ["model_b"])
 
     @patch("g4fagent.core.scan_models")
     def test_manager_scan_models_merges_defaults_and_passes_kwargs(self, scan_mock) -> None:
@@ -270,13 +454,24 @@ class TestModelScanner(unittest.TestCase):
             results=[],
         )
 
-        _ = manager.scan_models(models=["gpt_4o"], create_kwargs={"timeout": 30}, parallel=True, max_workers=2)
+        cb = lambda _item: None
+        stopper = lambda: False
+        _ = manager.scan_models(
+            models=["gpt_4o"],
+            create_kwargs={"timeout": 30},
+            parallel=True,
+            max_workers=2,
+            on_result=cb,
+            stop_requested=stopper,
+        )
 
         call_kwargs = scan_mock.call_args.kwargs
         self.assertEqual(call_kwargs["models"], ["gpt_4o"])
         self.assertEqual(call_kwargs["parallel"], True)
         self.assertEqual(call_kwargs["max_workers"], 2)
         self.assertEqual(call_kwargs["create_kwargs"]["timeout"], 30)
+        self.assertIs(call_kwargs["on_result"], cb)
+        self.assertIs(call_kwargs["stop_requested"], stopper)
 
     @patch("g4fagent.core.detect_verification_program_paths_util")
     def test_manager_detect_verification_program_paths_forwards_args(self, detect_mock) -> None:

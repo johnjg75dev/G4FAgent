@@ -86,6 +86,14 @@ class TestUtils(unittest.TestCase):
         self.assertIsNotNone(parsed)
         self.assertEqual(parsed["tool"], "read_file")
         self.assertIsNone(parse_tool_call("not json"))
+        mixed = (
+            '{"tool":"read_file","args":{"path":"backend/app/schemas.py"}}\n\n'
+            "Want best roleplay experience?\nhttps://llmplayground.net"
+        )
+        parsed_mixed = parse_tool_call(mixed)
+        self.assertIsNotNone(parsed_mixed)
+        self.assertEqual(parsed_mixed["tool"], "read_file")
+        self.assertEqual(parsed_mixed["args"]["path"], "backend/app/schemas.py")
 
     def test_sanitize_generated_file_content_prefers_fenced_block(self) -> None:
         text = "Here you go\n```python\nprint('x')\n```"

@@ -8,14 +8,27 @@ CLI wrapper for the g4fagent library.
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import re
+import shutil
+import signal
 import subprocess
+import sys
 import textwrap
+import time
 import zipfile
+from copy import deepcopy
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
-from g4fagent import G4FManager, Project
+from g4fagent import (
+    G4FManager,
+    Project,
+    list_known_model_names_for_provider,
+    list_known_provider_names,
+    resolve_provider_name,
+)
 from g4fagent.constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH
 from g4fagent.tools import ToolResult, ToolRuntime
 from g4fagent.utils import (
@@ -42,6 +55,196 @@ def run_tool(tools: ToolRuntime, call: Dict[str, Any]) -> ToolResult:
     return tools.execute(str(tool), args)
 
 
+def print_tool_call_console(tool_call: Dict[str, Any], *, auto_accept: bool, approval_needed: bool) -> None:
+    print_hr()
+    if approval_needed and auto_accept:
+        print("🛠️ Auto-approved tool call:")
+    elif approval_needed:
+        print("🛠️ Model requests tool call (approval required):")
+    else:
+        print("🛠️ Model requests tool call (auto-executed):")
+    print(pretty_json(tool_call))
+    print_hr()
+
+
+def read_json_dict(path: Path) -> Optional[Dict[str, Any]]:
+    try:
+        raw = path.read_text(encoding="utf-8", errors="replace")
+        parsed = json.loads(raw)
+    except Exception:
+        return None
+    if not isinstance(parsed, dict):
+        return None
+    return parsed
+
+
+def load_project_snapshot(path: Path) -> Optional[Dict[str, Any]]:
+    return read_json_dict(path)
+
+
+def project_needs_completion(snapshot: Optional[Dict[str, Any]]) -> bool:
+    if not isinstance(snapshot, dict):
+        return False
+    state = snapshot.get("state")
+    status = ""
+    if isinstance(state, dict):
+        status = str(state.get("status", "")).strip().lower()
+    if status in {"completed", "completed_with_quality_failures"}:
+        return False
+    return True
+
+
+def extract_saved_user_prompt(snapshot: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not isinstance(snapshot, dict):
+        return None
+    accepted = snapshot.get("accepted_data")
+    if not isinstance(accepted, dict):
+        return None
+    prompt = accepted.get("user_prompt")
+    if isinstance(prompt, str) and prompt.strip():
+        return prompt.strip()
+    return None
+
+
+def load_resume_payload(out_dir: Path, snapshot: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    user_prompt = extract_saved_user_prompt(snapshot)
+    if not user_prompt:
+        return None
+
+    accepted = snapshot.get("accepted_data")
+    accepted = accepted if isinstance(accepted, dict) else {}
+    plan_bucket = accepted.get("plan")
+    plan_bucket = plan_bucket if isinstance(plan_bucket, dict) else {}
+
+    plan_obj = read_json_dict(out_dir / "PROJECT_PLAN.json")
+    if plan_obj is None:
+        plan_json = plan_bucket.get("json")
+        if isinstance(plan_json, dict):
+            plan_obj = plan_json
+    if not isinstance(plan_obj, dict):
+        return None
+
+    todo_raw = plan_obj.get("todo", [])
+    todo = todo_raw if isinstance(todo_raw, list) else []
+
+    files_raw = plan_obj.get("files", [])
+    if not isinstance(files_raw, list) or not files_raw:
+        return None
+
+    files: List[Dict[str, Any]] = []
+    expected_files: List[str] = []
+    for item in files_raw:
+        if not isinstance(item, dict):
+            continue
+        path_value = item.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            continue
+        try:
+            rel = str(ensure_rel_path(path_value))
+        except ValueError:
+            continue
+        normalized = dict(item)
+        normalized["path"] = rel
+        files.append(normalized)
+        expected_files.append(rel)
+    if not files:
+        return None
+
+    plan_text_clean = ""
+    plan_md_path = out_dir / "PROJECT_PLAN.md"
+    if plan_md_path.exists() and plan_md_path.is_file():
+        plan_text_clean = plan_md_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not plan_text_clean:
+        plan_text = plan_bucket.get("text")
+        if isinstance(plan_text, str):
+            plan_text_clean = plan_text.strip()
+
+    return {
+        "user_prompt": user_prompt,
+        "plan_obj": plan_obj,
+        "todo": todo,
+        "files": files,
+        "expected_files": expected_files,
+        "plan_text_clean": plan_text_clean,
+    }
+
+
+def restore_project_from_snapshot(project: Project, snapshot: Dict[str, Any]) -> None:
+    project.name = str(snapshot.get("name") or project.name)
+
+    accepted = snapshot.get("accepted_data")
+    if isinstance(accepted, dict):
+        project.accepted_data = deepcopy(accepted)
+
+    chat_history = snapshot.get("chat_history")
+    if isinstance(chat_history, list):
+        project.chat_history = deepcopy(chat_history)
+
+    state = snapshot.get("state")
+    if isinstance(state, dict):
+        project.state = deepcopy(state)
+
+    project.files = []
+    for f in snapshot.get("files", []) if isinstance(snapshot.get("files"), list) else []:
+        if not isinstance(f, dict):
+            continue
+        path_value = f.get("path")
+        if not isinstance(path_value, str) or not path_value.strip():
+            continue
+        project.upsert_file(
+            path=str(path_value),
+            spec=f.get("spec"),
+            content=f.get("content"),
+            accepted=f.get("accepted"),
+            status=f.get("status"),
+            notes=f.get("notes"),
+        )
+
+
+def clear_directory_contents(path: Path) -> None:
+    if not path.exists() or not path.is_dir():
+        return
+    for child in path.iterdir():
+        if child.is_dir():
+            shutil.rmtree(child)
+        else:
+            child.unlink()
+
+
+def is_file_marked_complete(project: Project, rel_path: str) -> bool:
+    rel = str(rel_path)
+    tracked = project.get_file(rel)
+    if tracked is not None and tracked.accepted:
+        return True
+    accepted_files = project.accepted_data.get("accepted_files")
+    if isinstance(accepted_files, list) and rel in accepted_files:
+        return True
+    accepted_file_contents = project.accepted_data.get("files")
+    if isinstance(accepted_file_contents, dict) and rel in accepted_file_contents:
+        return True
+    return False
+
+
+def append_accepted_file_once(project: Project, rel_path: str) -> None:
+    rel = str(rel_path)
+    accepted_files = project.accepted_data.get("accepted_files")
+    if isinstance(accepted_files, list):
+        if rel not in accepted_files:
+            accepted_files.append(rel)
+        return
+    project.accept("accepted_files", [rel])
+
+
+def resolve_existing_file_policy(skip_existing: bool, force: bool) -> str:
+    if skip_existing and force:
+        raise ValueError("--skip-existing and --force cannot be used together.")
+    if skip_existing:
+        return "skip"
+    if force:
+        return "force"
+    return "prompt"
+
+
 def persist_project_state(tools: ToolRuntime, project: Project) -> None:
     tools.execute(
         "write_file",
@@ -53,9 +256,98 @@ def persist_project_state(tools: ToolRuntime, project: Project) -> None:
     )
 
 
+def chat_with_model_retry(
+    manager: G4FManager,
+    messages: List[Dict[str, Any]],
+    *,
+    model: str,
+    provider: Optional[str],
+    create_kwargs: Optional[Dict[str, Any]],
+    max_retries: int,
+    stage_name: Optional[str],
+    project: Optional[Project] = None,
+    tools: Optional[ToolRuntime] = None,
+    chat_delay_seconds: float = 0.0,
+    chat_delay_state: Optional[Dict[str, Any]] = None,
+    retry_no_selection_extra_delay_seconds: float = 5.0,
+) -> Tuple[str, str]:
+    current_model = str(model)
+    delay = max(0.0, float(chat_delay_seconds))
+    retry_extra_delay = max(0.0, float(retry_no_selection_extra_delay_seconds))
+    blank_retry_count = 0
+    while True:
+        try:
+            if delay > 0 and chat_delay_state is not None:
+                now = time.monotonic()
+                last_chat_time = chat_delay_state.get("last_chat_time")
+                if isinstance(last_chat_time, (int, float)):
+                    remaining = delay - (now - float(last_chat_time))
+                    if remaining > 0:
+                        time.sleep(remaining)
+                if blank_retry_count > 0 and retry_extra_delay > 0:
+                    time.sleep(retry_extra_delay * float(blank_retry_count))
+                chat_delay_state["last_chat_time"] = time.monotonic()
+
+            assistant = manager.chat(
+                messages,
+                model=current_model,
+                provider=provider,
+                create_kwargs=create_kwargs,
+                max_retries=max_retries,
+                stage_name=stage_name,
+            )
+            if delay > 0 and chat_delay_state is not None:
+                # Reset delay after receiving a response so the next outbound
+                # model request waits full delay from receive-time.
+                chat_delay_state["last_chat_time"] = time.monotonic()
+            return assistant, current_model
+        except KeyboardInterrupt:
+            raise
+        except Exception as e:
+            err_text = str(e)
+            print_hr("-")
+            print(
+                "Model request failed "
+                f"(stage={stage_name or 'unknown'}, provider={provider or 'auto'}, model={current_model})."
+            )
+            print(clamp(err_text, 3000))
+            print("Type a different model and press Enter to retry.")
+            print("Leave blank to retry the same model.")
+
+            if project is not None:
+                project.update_state(
+                    {
+                        "last_model_error": err_text,
+                        "last_failed_model": current_model,
+                        "last_failed_stage": stage_name,
+                    }
+                )
+                if tools is not None:
+                    persist_project_state(tools, project)
+
+            next_model = input("Retry model> ").strip()
+            if next_model:
+                current_model = next_model
+                blank_retry_count = 0
+                if project is not None:
+                    project.update_state(
+                        {
+                            "last_model_override": current_model,
+                            "last_model_override_stage": stage_name,
+                        }
+                    )
+                    if tools is not None:
+                        persist_project_state(tools, project)
+            else:
+                blank_retry_count += 1
+
+
 MUTATING_TOOLS = {"write_file", "apply_patch", "delete_file"}
 ERROR_LINE_RE = re.compile(r"\berror\b|\bfailed\b|traceback", re.IGNORECASE)
 WARNING_LINE_RE = re.compile(r"\bwarning\b", re.IGNORECASE)
+ANSI_GREEN = "\x1b[32m"
+ANSI_RED = "\x1b[31m"
+ANSI_RESET = "\x1b[0m"
 
 
 def find_debug_stage_name(manager: G4FManager) -> Optional[str]:
@@ -81,6 +373,29 @@ def normalize_commands(raw: Optional[List[str]]) -> List[str]:
         if stripped:
             cleaned.append(stripped)
     return cleaned
+
+
+def use_ansi_colors() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    try:
+        return bool(getattr(sys.stdout, "isatty", lambda: False)())
+    except Exception:
+        return False
+
+
+def color_scan_status(status: str) -> str:
+    if not use_ansi_colors():
+        return status
+    if status == "ok":
+        return f"{ANSI_GREEN}{status}{ANSI_RESET}"
+    return f"{ANSI_RED}{status}{ANSI_RESET}"
+
+
+def provider_model_label(provider: Any, model: Any) -> str:
+    provider_text = str(provider or "auto").strip() or "auto"
+    model_text = str(model or "").strip()
+    return f"{provider_text}/{model_text}"
 
 
 def extract_diagnostics(stdout: str, stderr: str) -> Dict[str, List[str]]:
@@ -211,9 +526,13 @@ def run_debug_stage_round(
     todo: List[Any],
     quality_report: Dict[str, Any],
     cli_model: Optional[str],
+    cli_provider: Optional[str],
     cli_temperature: Optional[float],
     auto_accept: bool,
     max_tool_steps: int,
+    chat_delay_seconds: float = 0.0,
+    chat_delay_state: Optional[Dict[str, Any]] = None,
+    chat_retry_extra_delay_seconds: float = 5.0,
 ) -> Dict[str, Any]:
     debug_context = {
         "project_request": user_prompt,
@@ -228,31 +547,37 @@ def run_debug_stage_round(
             "quality_report_json": pretty_json(quality_report),
         },
     )
-    model, provider, kwargs, retries = manager.build_stage_request(stage_name, cli_model, cli_temperature)
+    model, provider, kwargs, retries = manager.build_stage_request(
+        stage_name,
+        cli_model,
+        cli_provider,
+        cli_temperature,
+    )
 
     tool_steps = 0
     summary = ""
     while tool_steps < max_tool_steps:
-        assistant = manager.chat(
+        assistant, model = chat_with_model_retry(
+            manager,
             messages,
             model=model,
             provider=provider,
             create_kwargs=kwargs,
             max_retries=retries,
             stage_name=stage_name,
+            project=project,
+            tools=tools,
+            chat_delay_seconds=chat_delay_seconds,
+            chat_delay_state=chat_delay_state,
+            retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
         )
         tool_call = parse_tool_call(assistant)
         if tool_call:
             tool = str(tool_call.get("tool"))
-            if tool in MUTATING_TOOLS:
-                if auto_accept:
-                    print("Auto-approved debug tool call:")
-                    print(pretty_json(tool_call))
-                else:
-                    print_hr()
-                    print("Debug model requests tool call (approval required):")
-                    print(pretty_json(tool_call))
-                    print_hr()
+            approval_needed = tool in MUTATING_TOOLS
+            print_tool_call_console(tool_call, auto_accept=auto_accept, approval_needed=approval_needed)
+            if approval_needed:
+                if not auto_accept:
                     ok = ask_choice("Approve this debug tool call?", {"y": "yes", "n": "no"}, "y")
                     if ok != "y":
                         messages.append(msg("assistant", assistant))
@@ -286,10 +611,63 @@ def run_debug_stage_round(
     }
 
 
+def print_model_scan_report(report: Dict[str, Any]) -> None:
+    print_hr()
+    print("Model scan report")
+    print(
+        "Summary: "
+        f"total={report.get('total', 0)}, "
+        f"ok={report.get('ok_count', 0)}, "
+        f"failed={report.get('failed_count', 0)}, "
+        f"no_response={report.get('no_response_count', 0)}, "
+        f"errors={report.get('error_count', 0)}"
+    )
+    working = report.get("working_provider_models", []) or report.get("working_models", []) or []
+    failing = report.get("failing_provider_models", []) or report.get("failing_models", []) or []
+    if working:
+        print(f"Working models ({len(working)}): {', '.join(working[:25])}")
+    if failing:
+        print(f"Failing models ({len(failing)}): {', '.join(failing[:25])}")
+
+    for idx, item in enumerate(report.get("results", []), start=1):
+        model = item.get("model", "")
+        provider = item.get("provider", "auto")
+        provider_model = item.get("provider_model") or provider_model_label(provider, model)
+        status = item.get("status", "")
+        elapsed = item.get("elapsed_seconds", 0)
+        print(f"[{idx}] {provider_model} -> {color_scan_status(str(status))} ({elapsed}s)")
+        err = item.get("error")
+        preview = item.get("response_preview")
+        if err:
+            print(f"  error: {clamp(str(err), 300)}")
+        elif preview:
+            print(f"  preview: {clamp(str(preview), 300)}")
+    print_hr()
+
+
+def print_provider_list(providers: List[str]) -> None:
+    print_hr("-")
+    print("Available g4f providers")
+    print(f"Total: {len(providers)}")
+    for idx, provider_name in enumerate(providers, start=1):
+        print(f"[{idx}] {provider_name}")
+    print_hr("-")
+
+
+def print_provider_model_list(provider_name: str, models: List[str]) -> None:
+    print_hr("-")
+    print(f"Models for provider: {provider_name}")
+    print(f"Total: {len(models)}")
+    for idx, model_name in enumerate(models, start=1):
+        print(f"[{idx}] {model_name}")
+    print_hr("-")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="Agentic G4F project scaffolder")
-    ap.add_argument("--out", required=True, help="Output project directory")
+    ap.add_argument("--out", required=False, help="Output project directory")
     ap.add_argument("--model", default=None, help="Optional model name/string for g4f")
+    ap.add_argument("--provider", default=None, help="Optional provider override for all non-scan stages.")
     ap.add_argument(
         "--config",
         default=DEFAULT_CONFIG_REL_PATH,
@@ -311,6 +689,21 @@ def main() -> int:
         help="Additional directory containing custom tool modules (*.py). Can be repeated.",
     )
     ap.add_argument("--temperature", type=float, default=None, help="Sampling temperature override for all stages")
+    ap.add_argument(
+        "--chat-delay",
+        type=float,
+        default=0.0,
+        help="Minimum seconds between outbound non-scan model chat requests.",
+    )
+    ap.add_argument(
+        "--chat-retry-extra-delay",
+        type=float,
+        default=5.0,
+        help=(
+            "Additional seconds per blank 'Retry model' input when --chat-delay > 0. "
+            "Applied cumulatively for consecutive blank retries in the same step."
+        ),
+    )
     ap.add_argument(
         "--lint-cmd",
         action="append",
@@ -337,10 +730,91 @@ def main() -> int:
         default=None,
         help="Max tool-call turns allowed in each debug round.",
     )
+    ap.add_argument("--scan-models", action="store_true", help="Scan g4f models and report which ones respond.")
+    ap.add_argument(
+        "--scan-model",
+        action="append",
+        default=[],
+        help="Model alias/name to scan. Repeat to probe multiple specific models.",
+    )
+    ap.add_argument("--scan-provider", default=None, help="Optional provider override for model scanning.")
+    ap.add_argument(
+        "--scan-prompt",
+        default="Reply with exactly: OK",
+        help="Probe prompt used for model scanning.",
+    )
+    ap.add_argument("--scan-timeout", type=float, default=30.0, help="Per-call timeout in seconds for model scans.")
+    ap.add_argument("--scan-delay", type=float, default=0.0, help="Delay between scan starts in seconds.")
+    ap.add_argument("--scan-parallel", action="store_true", help="Run scan calls in parallel.")
+    ap.add_argument("--scan-workers", type=int, default=4, help="Max workers for parallel model scans.")
+    ap.add_argument("--scan-output", default=None, help="Optional file path to write scan JSON results.")
+    ap.add_argument("--list-providers", action="store_true", help="List valid g4f provider names and exit.")
+    ap.add_argument(
+        "--list-models-for-provider",
+        default=None,
+        help="List valid model aliases for the specified provider and exit.",
+    )
+    ap.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Skip planned files that already exist on disk without querying the model.",
+    )
+    ap.add_argument(
+        "--force",
+        action="store_true",
+        help="Allow overwrite flow for existing files without prompting for existing-file handling.",
+    )
     args = ap.parse_args()
 
-    out_dir = Path(args.out).resolve()
-    out_dir.mkdir(parents=True, exist_ok=True)
+    try:
+        existing_file_policy = resolve_existing_file_policy(
+            skip_existing=bool(args.skip_existing),
+            force=bool(args.force),
+        )
+    except ValueError as e:
+        print(str(e))
+        return 2
+
+    if args.chat_delay is not None and args.chat_delay < 0:
+        print("--chat-delay must be >= 0")
+        return 2
+    chat_delay_seconds = max(0.0, float(args.chat_delay or 0.0))
+    if args.chat_retry_extra_delay is not None and args.chat_retry_extra_delay < 0:
+        print("--chat-retry-extra-delay must be >= 0")
+        return 2
+    chat_retry_extra_delay_seconds = max(0.0, float(args.chat_retry_extra_delay or 0.0))
+    chat_delay_state: Dict[str, Any] = {"last_chat_time": None}
+
+    cli_provider_override: Optional[str] = None
+    if args.provider is not None:
+        requested_provider_override = str(args.provider).strip()
+        if requested_provider_override:
+            cli_provider_override = resolve_provider_name(requested_provider_override) or requested_provider_override
+
+    list_mode_used = False
+    if args.list_providers:
+        providers = list_known_provider_names(include_meta=False)
+        print_provider_list(providers)
+        list_mode_used = True
+
+    if args.list_models_for_provider is not None:
+        requested_provider = str(args.list_models_for_provider).strip()
+        if not requested_provider:
+            print("--list-models-for-provider requires a non-empty provider name.")
+            return 2
+        resolved_provider = resolve_provider_name(requested_provider)
+        if resolved_provider is None:
+            print(f"Unknown provider: {requested_provider}")
+            known = list_known_provider_names(include_meta=False)
+            if known:
+                print(f"Try one of: {', '.join(known[:30])}")
+            return 2
+        provider_models = list_known_model_names_for_provider(resolved_provider)
+        print_provider_model_list(resolved_provider, provider_models)
+        list_mode_used = True
+
+    if list_mode_used:
+        return 0
 
     config_arg = Path(args.config)
     if args.config == DEFAULT_CONFIG_REL_PATH:
@@ -354,6 +828,137 @@ def main() -> int:
         config_rel_path = args.config
 
     manager = G4FManager.from_config(config_rel_path=config_rel_path, base_dir=config_base_dir)
+
+    if args.scan_models:
+        scan_models = [m.strip() for m in (args.scan_model or []) if isinstance(m, str) and m.strip()]
+        if args.scan_timeout is not None and args.scan_timeout <= 0:
+            print("--scan-timeout must be > 0")
+            return 2
+        if args.scan_workers <= 0:
+            print("--scan-workers must be > 0")
+            return 2
+
+        print_hr()
+        print("Scanning models...")
+        print("Press Ctrl+C once to stop early and keep partial results.")
+        stream_state = {"count": 0, "stop_requested": False}
+        previous_sigint = signal.getsignal(signal.SIGINT)
+
+        def request_scan_stop(reason: str) -> None:
+            if stream_state["stop_requested"]:
+                return
+            stream_state["stop_requested"] = True
+            print(f"\nStop requested ({reason}). Finishing current calls and returning partial results...")
+
+        def handle_sigint(_signum: int, _frame: Any) -> None:
+            if stream_state["stop_requested"]:
+                raise KeyboardInterrupt
+            request_scan_stop("Ctrl+C")
+
+        def stream_scan_result(result: Any) -> None:
+            stream_state["count"] += 1
+            model = str(getattr(result, "model", ""))
+            provider = str(getattr(result, "provider", "auto"))
+            provider_model = str(getattr(result, "provider_model", "") or provider_model_label(provider, model))
+            status = str(getattr(result, "status", ""))
+            elapsed = getattr(result, "elapsed_seconds", 0)
+            print(
+                f"[{stream_state['count']}] {provider_model} -> {color_scan_status(status)} ({elapsed}s)",
+                flush=True,
+            )
+            err = getattr(result, "error", None)
+            preview = getattr(result, "response_preview", "")
+            if err:
+                print(f"  error: {clamp(str(err), 300)}", flush=True)
+            elif preview:
+                print(f"  preview: {clamp(str(preview), 300)}", flush=True)
+
+        signal.signal(signal.SIGINT, handle_sigint)
+        try:
+            scan_summary = manager.scan_models(
+                models=scan_models or None,
+                provider=args.scan_provider,
+                prompt=args.scan_prompt,
+                create_kwargs={"timeout": args.scan_timeout} if args.scan_timeout is not None else {},
+                delay_seconds=max(0.0, float(args.scan_delay)),
+                parallel=bool(args.scan_parallel),
+                max_workers=int(args.scan_workers),
+                on_result=stream_scan_result,
+                stop_requested=lambda: bool(stream_state["stop_requested"]),
+            )
+        except KeyboardInterrupt:
+            print("\nScan aborted immediately.")
+            return 130
+        finally:
+            signal.signal(signal.SIGINT, previous_sigint)
+        report = scan_summary.to_dict()
+        if report.get("stopped"):
+            print(
+                f"Scan stopped early after {report.get('total', 0)} result(s) "
+                f"(reason={report.get('stop_reason') or 'stop_requested'})."
+            )
+        print_model_scan_report(report)
+
+        if args.scan_output:
+            output_path = Path(args.scan_output).resolve()
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            output_path.write_text(pretty_json(report) + "\n", encoding="utf-8")
+            print(f"Saved scan output to: {output_path}")
+        return 0
+
+    if not args.out:
+        ap.error("--out is required unless --scan-models is used.")
+
+    out_dir = Path(args.out).resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+    state_path = out_dir / "PROJECT_STATE.json"
+    startup_mode = "new"
+    startup_snapshot: Optional[Dict[str, Any]] = None
+    startup_resume_payload: Optional[Dict[str, Any]] = None
+    startup_seed_prompt: Optional[str] = None
+
+    existing_snapshot = load_project_snapshot(state_path) if state_path.exists() else None
+    if existing_snapshot and project_needs_completion(existing_snapshot):
+        print_hr()
+        saved_state = existing_snapshot.get("state")
+        saved_status = str(saved_state.get("status", "unknown")) if isinstance(saved_state, dict) else "unknown"
+        print(f"Detected incomplete PROJECT_STATE.json in {out_dir} (status={saved_status}).")
+        action = ask_choice(
+            "How would you like to proceed?",
+            {
+                "r": "resume incomplete build",
+                "s": "restart from beginning with same prompt",
+                "n": "clear output directory and start new project",
+                "q": "quit",
+            },
+            "r",
+        )
+        if action == "q":
+            print("Cancelled by user.")
+            return 0
+        if action == "n":
+            clear_directory_contents(out_dir)
+            startup_mode = "new"
+            startup_snapshot = None
+        elif action == "s":
+            startup_mode = "restart"
+            startup_seed_prompt = extract_saved_user_prompt(existing_snapshot)
+            startup_snapshot = existing_snapshot
+            if not startup_seed_prompt:
+                print("Saved prompt not found in PROJECT_STATE.json; you will be prompted for a new prompt.")
+        else:
+            startup_mode = "resume"
+            startup_snapshot = existing_snapshot
+            startup_resume_payload = load_resume_payload(out_dir, existing_snapshot)
+            if not startup_resume_payload:
+                print("Resume data is incomplete. Falling back to restart with saved prompt.")
+                startup_mode = "restart"
+                startup_seed_prompt = extract_saved_user_prompt(existing_snapshot)
+    elif existing_snapshot:
+        print_hr()
+        print("Existing PROJECT_STATE.json indicates the project is already complete.")
+        print("Starting a new run will proceed with normal prompts and may overwrite generated files.")
+
     planning_stage, writing_stage = manager.default_stage_names()
     debug_stage = find_debug_stage_name(manager)
     runtime_quality = dict((manager.runtime_cfg.get("quality_checks", {}) or {}))
@@ -384,10 +989,18 @@ def main() -> int:
         print(f"Failed to initialize tools: {e}")
         return 1
     project = manager.get_project()
+    if startup_mode == "resume" and startup_snapshot is not None:
+        restore_project_from_snapshot(project, startup_snapshot)
+    else:
+        project.name = out_dir.name
+        project.accepted_data = {}
+        project.chat_history = []
+        project.state = {}
+        project.files = []
+
     project.name = out_dir.name
     project.update_state(
         {
-            "status": "initialized",
             "output_dir": str(out_dir),
             "config_path": str(manager.runtime_cfg["_meta"]["config_path"]),
             "agents_dir": str(manager.runtime_cfg["_meta"]["agents_dir"]),
@@ -404,10 +1017,17 @@ def main() -> int:
                 "max_debug_rounds": max_debug_rounds,
                 "debug_max_tool_steps": debug_max_tool_steps,
             },
-            "current_stage": None,
-            "current_file": None,
+            "startup_mode": startup_mode,
+            "chat_delay_seconds": chat_delay_seconds,
+            "chat_retry_extra_delay_seconds": chat_retry_extra_delay_seconds,
+            "existing_file_policy": existing_file_policy,
+            "force": bool(args.force),
+            "skip_existing": bool(args.skip_existing),
+            "cli_provider_override": cli_provider_override,
         }
     )
+    if startup_mode != "resume":
+        project.update_state({"status": "initialized", "current_stage": None, "current_file": None})
     persist_project_state(tools, project)
 
     print_hr()
@@ -425,20 +1045,20 @@ def main() -> int:
         f"{planning_stage} role/model/provider: "
         f"{manager.stage_role_name(planning_stage)} / "
         f"{manager.stage_model_label(planning_stage, args.model)} / "
-        f"{manager.stage_provider_label(planning_stage) or 'auto'}"
+        f"{cli_provider_override or manager.stage_provider_label(planning_stage) or 'auto'}"
     )
     print(
         f"{writing_stage} role/model/provider: "
         f"{manager.stage_role_name(writing_stage)} / "
         f"{manager.stage_model_label(writing_stage, args.model)} / "
-        f"{manager.stage_provider_label(writing_stage) or 'auto'}"
+        f"{cli_provider_override or manager.stage_provider_label(writing_stage) or 'auto'}"
     )
     if debug_stage:
         print(
             f"{debug_stage} role/model/provider: "
             f"{manager.stage_role_name(debug_stage)} / "
             f"{manager.stage_model_label(debug_stage, args.model)} / "
-            f"{manager.stage_provider_label(debug_stage) or 'auto'}"
+            f"{cli_provider_override or manager.stage_provider_label(debug_stage) or 'auto'}"
         )
     if quality_checks_enabled:
         print("Quality checks: enabled")
@@ -450,168 +1070,269 @@ def main() -> int:
     else:
         print("Quality checks: disabled (no lint/test commands configured)")
     print(f"Mode: {'auto-accept' if args.auto_accept else 'interactive'}")
+    print(f"Startup mode: {startup_mode}")
+    print(f"Chat delay: {chat_delay_seconds}s")
+    print(f"Chat retry extra delay: {chat_retry_extra_delay_seconds}s")
+    print(f"Existing-file policy: {existing_file_policy}")
     print_hr()
 
-    user_prompt = prompt_multiline("Describe your coding project (requirements, constraints, stack, etc.).")
-    if not user_prompt:
-        print("No prompt provided. Exiting.")
-        return 1
-    project.accept("user_prompt", user_prompt)
-    project.update_state({"status": "planning", "current_stage": planning_stage})
-    persist_project_state(tools, project)
+    user_prompt = ""
+    plan_text_clean = ""
+    plan_obj: Optional[Dict[str, Any]] = None
+    todo: List[Any] = []
+    files: List[Dict[str, Any]] = []
+    expected_files: List[str] = []
 
-    plan_messages = manager.build_stage_messages(
-        planning_stage,
-        {
-            "user_prompt": user_prompt,
-        },
-    )
-    plan_model, plan_provider, plan_kwargs, plan_retries = manager.build_stage_request(
-        planning_stage,
-        args.model,
-        args.temperature,
-    )
+    if startup_mode == "resume" and startup_resume_payload is not None:
+        user_prompt = str(startup_resume_payload.get("user_prompt", "")).strip()
+        plan_obj = startup_resume_payload.get("plan_obj")
+        todo = list(startup_resume_payload.get("todo", []))
+        files = list(startup_resume_payload.get("files", []))
+        expected_files = list(startup_resume_payload.get("expected_files", []))
+        plan_text_clean = str(startup_resume_payload.get("plan_text_clean", "")).strip()
+        if not user_prompt or not isinstance(plan_obj, dict) or not files:
+            print("Resume data is incomplete. Exiting.")
+            project.update_state({"status": "failed", "reason": "resume_data_invalid"})
+            persist_project_state(tools, project)
+            return 2
+        if not plan_text_clean:
+            plan_text_clean = pretty_json(plan_obj)
 
-    print_hr()
-    print("🧠 Generating plan (TODO + layout + file specs)...")
-    plan_text = manager.chat(
-        plan_messages,
-        model=plan_model,
-        provider=plan_provider,
-        create_kwargs=plan_kwargs,
-        max_retries=plan_retries,
-        stage_name=planning_stage,
-    )
-    plan_text_clean, plan_obj = extract_plan_json(plan_text)
+        print_hr()
+        print("▶ Resuming incomplete build using saved PROJECT_STATE.json data.")
+        print(f"Files in plan: {len(files)}")
+        print_hr()
 
-    print_hr()
-    print("📋 Proposed plan:\n")
-    print(plan_text_clean)
-    print_hr()
+        project.accept("user_prompt", user_prompt)
+        project.accept(
+            "plan",
+            {
+                "text": plan_text_clean,
+                "json": plan_obj,
+                "todo": todo,
+                "expected_files": expected_files,
+            },
+        )
+        for f in files:
+            if not isinstance(f, dict):
+                continue
+            p = f.get("path")
+            if not isinstance(p, str) or not p:
+                continue
+            try:
+                rel = str(ensure_rel_path(p))
+            except ValueError:
+                continue
+            project.upsert_file(rel, spec=str(f.get("spec", "") or ""))
+        project.update_state(
+            {
+                "status": "writing",
+                "current_stage": writing_stage,
+                "total_planned_files": len(expected_files),
+            }
+        )
+        tools.execute("write_file", {"path": "PROJECT_PLAN.md", "content": plan_text_clean + "\n", "overwrite": True})
+        tools.execute(
+            "write_file",
+            {"path": "PROJECT_PLAN.json", "content": pretty_json(plan_obj) + "\n", "overwrite": True},
+        )
+        persist_project_state(tools, project)
+    else:
+        if startup_mode == "restart" and startup_seed_prompt:
+            user_prompt = startup_seed_prompt
+            print_hr()
+            print("Restarting from the beginning using the saved prompt from PROJECT_STATE.json.")
+            print_hr()
+        else:
+            user_prompt = prompt_multiline("Describe your coding project (requirements, constraints, stack, etc.).")
+        if not user_prompt:
+            print("No prompt provided. Exiting.")
+            return 1
+        project.accept("user_prompt", user_prompt)
+        project.update_state({"status": "planning", "current_stage": planning_stage})
+        persist_project_state(tools, project)
 
-    if not plan_obj:
-        print("⚠️ Could not parse <PLAN_JSON>. We'll continue, but file iteration needs JSON.")
-        fix_messages = plan_messages + [
-            msg("assistant", plan_text),
-            msg("user", "Output ONLY the <PLAN_JSON> block again with valid JSON."),
-        ]
-        fix = manager.chat(
-            fix_messages,
+        plan_messages = manager.build_stage_messages(
+            planning_stage,
+            {
+                "user_prompt": user_prompt,
+            },
+        )
+        plan_model, plan_provider, plan_kwargs, plan_retries = manager.build_stage_request(
+            planning_stage,
+            args.model,
+            cli_provider_override,
+            args.temperature,
+        )
+
+        print_hr()
+        print("🧠 Generating plan (TODO + layout + file specs)...")
+        plan_text, plan_model = chat_with_model_retry(
+            manager,
+            plan_messages,
             model=plan_model,
             provider=plan_provider,
             create_kwargs=plan_kwargs,
             max_retries=plan_retries,
             stage_name=planning_stage,
+            project=project,
+            tools=tools,
+            chat_delay_seconds=chat_delay_seconds,
+            chat_delay_state=chat_delay_state,
+            retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
         )
-        _, plan_obj = extract_plan_json(fix)
+        plan_text_clean, plan_obj = extract_plan_json(plan_text)
+
+        print_hr()
+        print("📋 Proposed plan:\n")
+        print(plan_text_clean)
+        print_hr()
+
         if not plan_obj:
-            print("Still no valid plan JSON. Exiting to avoid chaos.")
-            project.update_state({"status": "failed", "reason": "plan_json_missing"})
+            print("⚠️ Could not parse <PLAN_JSON>. We'll continue, but file iteration needs JSON.")
+            fix_messages = plan_messages + [
+                msg("assistant", plan_text),
+                msg("user", "Output ONLY the <PLAN_JSON> block again with valid JSON."),
+            ]
+            fix, plan_model = chat_with_model_retry(
+                manager,
+                fix_messages,
+                model=plan_model,
+                provider=plan_provider,
+                create_kwargs=plan_kwargs,
+                max_retries=plan_retries,
+                stage_name=planning_stage,
+                project=project,
+                tools=tools,
+                chat_delay_seconds=chat_delay_seconds,
+                chat_delay_state=chat_delay_state,
+                retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
+            )
+            _, plan_obj = extract_plan_json(fix)
+            if not plan_obj:
+                print("Still no valid plan JSON. Exiting to avoid chaos.")
+                project.update_state({"status": "failed", "reason": "plan_json_missing"})
+                persist_project_state(tools, project)
+                return 2
+
+        while True:
+            choice = ask_choice(
+                "Plan OK?",
+                {"a": "accept", "f": "feedback/amend", "q": "quit"},
+                "a",
+            )
+            if choice == "a":
+                break
+            if choice == "q":
+                project.update_state({"status": "cancelled", "reason": "plan_rejected"})
+                persist_project_state(tools, project)
+                return 0
+            fb = prompt_multiline("Enter feedback to amend the plan.")
+            amend_messages = plan_messages + [
+                msg("assistant", plan_text),
+                msg("user", "Revise the plan based on this feedback and keep the same <PLAN_JSON> output format:\n\n" + fb),
+            ]
+            plan_text, plan_model = chat_with_model_retry(
+                manager,
+                amend_messages,
+                model=plan_model,
+                provider=plan_provider,
+                create_kwargs=plan_kwargs,
+                max_retries=plan_retries,
+                stage_name=planning_stage,
+                project=project,
+                tools=tools,
+                chat_delay_seconds=chat_delay_seconds,
+                chat_delay_state=chat_delay_state,
+                retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
+            )
+            plan_text_clean, plan_obj = extract_plan_json(plan_text)
+            print_hr()
+            print("🔁 Revised plan:\n")
+            print(plan_text_clean)
+            print_hr()
+            if not plan_obj:
+                print("⚠️ Revised plan missing valid <PLAN_JSON>. Try feedback again.")
+                continue
+
+        if plan_obj is None:
+            print("No valid plan JSON available after approval loop. Exiting.")
+            project.update_state({"status": "failed", "reason": "no_plan_json_after_approval"})
             persist_project_state(tools, project)
             return 2
 
-    while True:
-        choice = ask_choice(
-            "Plan OK?",
-            {"a": "accept", "f": "feedback/amend", "q": "quit"},
-            "a",
-        )
-        if choice == "a":
-            break
-        if choice == "q":
-            project.update_state({"status": "cancelled", "reason": "plan_rejected"})
+        todo_raw = plan_obj.get("todo", [])
+        todo = todo_raw if isinstance(todo_raw, list) else []
+        files_raw = plan_obj.get("files", [])
+        files = files_raw if isinstance(files_raw, list) else []
+
+        if not files:
+            print("No files in plan JSON. Exiting.")
+            project.update_state({"status": "failed", "reason": "no_files_in_plan"})
             persist_project_state(tools, project)
-            return 0
-        fb = prompt_multiline("Enter feedback to amend the plan.")
-        amend_messages = plan_messages + [
-            msg("assistant", plan_text),
-            msg("user", "Revise the plan based on this feedback and keep the same <PLAN_JSON> output format:\n\n" + fb),
-        ]
-        plan_text = manager.chat(
-            amend_messages,
-            model=plan_model,
-            provider=plan_provider,
-            create_kwargs=plan_kwargs,
-            max_retries=plan_retries,
-            stage_name=planning_stage,
+            return 3
+
+        expected_files = []
+        for f in files:
+            if isinstance(f, dict):
+                p = f.get("path")
+                if isinstance(p, str) and p:
+                    try:
+                        expected_files.append(str(ensure_rel_path(p)))
+                    except ValueError:
+                        continue
+        project.accept(
+            "plan",
+            {
+                "text": plan_text_clean,
+                "json": plan_obj,
+                "todo": todo,
+                "expected_files": expected_files,
+            },
         )
-        plan_text_clean, plan_obj = extract_plan_json(plan_text)
-        print_hr()
-        print("🔁 Revised plan:\n")
-        print(plan_text_clean)
-        print_hr()
-        if not plan_obj:
-            print("⚠️ Revised plan missing valid <PLAN_JSON>. Try feedback again.")
-            continue
-
-    if plan_obj is None:
-        print("No valid plan JSON available after approval loop. Exiting.")
-        project.update_state({"status": "failed", "reason": "no_plan_json_after_approval"})
-        persist_project_state(tools, project)
-        return 2
-
-    todo = plan_obj.get("todo", [])
-    files = plan_obj.get("files", [])
-
-    if not isinstance(files, list) or not files:
-        print("No files in plan JSON. Exiting.")
-        project.update_state({"status": "failed", "reason": "no_files_in_plan"})
-        persist_project_state(tools, project)
-        return 3
-
-    expected_files: List[str] = []
-    for f in files:
-        if isinstance(f, dict):
+        for f in files:
+            if not isinstance(f, dict):
+                continue
             p = f.get("path")
-            if isinstance(p, str) and p:
-                try:
-                    expected_files.append(str(ensure_rel_path(p)))
-                except ValueError:
-                    continue
-    project.accept(
-        "plan",
-        {
-            "text": plan_text_clean,
-            "json": plan_obj,
-            "todo": todo,
-            "expected_files": expected_files,
-        },
-    )
-    for f in files:
-        if not isinstance(f, dict):
-            continue
-        p = f.get("path")
-        if not isinstance(p, str) or not p:
-            continue
-        try:
-            rel = str(ensure_rel_path(p))
-        except ValueError:
-            continue
-        project.upsert_file(rel, spec=str(f.get("spec", "") or ""))
-    project.update_state(
-        {
-            "status": "writing",
-            "current_stage": writing_stage,
-            "total_planned_files": len(expected_files),
-        }
-    )
+            if not isinstance(p, str) or not p:
+                continue
+            try:
+                rel = str(ensure_rel_path(p))
+            except ValueError:
+                continue
+            project.upsert_file(rel, spec=str(f.get("spec", "") or ""))
+        project.update_state(
+            {
+                "status": "writing",
+                "current_stage": writing_stage,
+                "total_planned_files": len(expected_files),
+            }
+        )
 
-    tools.execute("write_file", {"path": "PROJECT_PLAN.md", "content": plan_text_clean + "\n", "overwrite": True})
-    tools.execute("write_file", {"path": "PROJECT_PLAN.json", "content": pretty_json(plan_obj) + "\n", "overwrite": True})
-    persist_project_state(tools, project)
+        tools.execute("write_file", {"path": "PROJECT_PLAN.md", "content": plan_text_clean + "\n", "overwrite": True})
+        tools.execute(
+            "write_file",
+            {"path": "PROJECT_PLAN.json", "content": pretty_json(plan_obj) + "\n", "overwrite": True},
+        )
+        persist_project_state(tools, project)
 
     print_hr()
     print("✍️ Writing files one-by-one with approval.")
+    print(f"Existing-file handling: {existing_file_policy}")
     print("Tools available to the model: list_dir/read_file/write_file/apply_patch/delete_file")
     print_hr()
 
     write_model, write_provider, write_kwargs, write_retries = manager.build_stage_request(
         writing_stage,
         args.model,
+        cli_provider_override,
         args.temperature,
     )
 
     for idx, f in enumerate(files, start=1):
+        if not isinstance(f, dict):
+            print(f"Skipping invalid file entry: {f}")
+            continue
         path = f.get("path")
         spec = f.get("spec", "")
         if not path or not isinstance(path, str):
@@ -619,6 +1340,11 @@ def main() -> int:
             continue
 
         rel = str(ensure_rel_path(path))
+        if startup_mode == "resume" and is_file_marked_complete(project, rel):
+            print(f"⏩ Already completed in saved state, skipping: {rel}")
+            project.set_state("files_processed", idx)
+            persist_project_state(tools, project)
+            continue
         abs_path = out_dir / rel
         abs_path.parent.mkdir(parents=True, exist_ok=True)
         project.update_state({"current_file": rel, "files_processed": idx - 1})
@@ -637,6 +1363,51 @@ def main() -> int:
             print("Preview:")
             print(clamp(existing, 800))
             print_hr()
+
+            if existing_file_policy == "skip":
+                print(f"⏩ Keeping existing file due --skip-existing: {rel}")
+                project.upsert_file(
+                    rel,
+                    content=existing,
+                    accepted=True,
+                    status="kept_existing",
+                    notes="Kept existing file (--skip-existing)",
+                )
+                project.set_accepted_entry("files", rel, existing)
+                append_accepted_file_once(project, rel)
+                project.set_state("files_processed", idx)
+                persist_project_state(tools, project)
+                continue
+
+            if existing_file_policy == "prompt":
+                existing_choice = ask_choice(
+                    f"Existing file found for {rel}. How should it be handled?",
+                    {"o": "overwrite/generate", "k": "keep existing and skip", "q": "quit"},
+                    "k",
+                )
+                if existing_choice == "q":
+                    print("Stopping early.")
+                    project.update_state({"status": "cancelled", "reason": "user_quit_on_existing_file_prompt"})
+                    persist_project_state(tools, project)
+                    if args.zip:
+                        make_zip(out_dir)
+                    return 0
+                if existing_choice == "k":
+                    print(f"⏩ Keeping existing file (user choice): {rel}")
+                    project.upsert_file(
+                        rel,
+                        content=existing,
+                        accepted=True,
+                        status="kept_existing",
+                        notes="Kept existing file (user choice)",
+                    )
+                    project.set_accepted_entry("files", rel, existing)
+                    append_accepted_file_once(project, rel)
+                    project.set_state("files_processed", idx)
+                    persist_project_state(tools, project)
+                    continue
+            elif existing_file_policy == "force":
+                print("⚠️ --force enabled: proceeding with overwrite/generation flow for existing file.")
 
         file_context = {
             "project_request": user_prompt,
@@ -661,27 +1432,27 @@ def main() -> int:
         MAX_TOOL_STEPS = 8
 
         while tool_steps < MAX_TOOL_STEPS:
-            assistant = manager.chat(
+            assistant, write_model = chat_with_model_retry(
+                manager,
                 messages,
                 model=write_model,
                 provider=write_provider,
                 create_kwargs=write_kwargs,
                 max_retries=write_retries,
                 stage_name=writing_stage,
+                project=project,
+                tools=tools,
+                chat_delay_seconds=chat_delay_seconds,
+                chat_delay_state=chat_delay_state,
+                retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
             )
             tool_call = parse_tool_call(assistant)
             if tool_call:
                 tool = tool_call["tool"]
                 approval_needed = tool in {"write_file", "apply_patch", "delete_file"}
+                print_tool_call_console(tool_call, auto_accept=args.auto_accept, approval_needed=approval_needed)
                 if approval_needed:
-                    if args.auto_accept:
-                        print("🛠️ Auto-approved tool call:")
-                        print(pretty_json(tool_call))
-                    else:
-                        print_hr()
-                        print("🛠️ Model requests tool call (approval required):")
-                        print(pretty_json(tool_call))
-                        print_hr()
+                    if not args.auto_accept:
                         ok = ask_choice("Approve this tool call?", {"y": "yes", "n": "no"}, "y")
                         if ok != "y":
                             messages.append(msg("assistant", assistant))
@@ -730,7 +1501,7 @@ def main() -> int:
                 print(f"✅ Wrote {rel} (auto-accept)")
                 project.upsert_file(rel, content=current_content, accepted=True, status="written")
                 project.set_accepted_entry("files", rel, current_content)
-                project.append_accepted("accepted_files", rel)
+                append_accepted_file_once(project, rel)
                 project.set_state("files_processed", idx)
                 persist_project_state(tools, project)
                 break
@@ -745,7 +1516,7 @@ def main() -> int:
                 print(f"✅ Wrote {rel}")
                 project.upsert_file(rel, content=current_content, accepted=True, status="written")
                 project.set_accepted_entry("files", rel, current_content)
-                project.append_accepted("accepted_files", rel)
+                append_accepted_file_once(project, rel)
                 project.set_state("files_processed", idx)
                 persist_project_state(tools, project)
                 break
@@ -773,27 +1544,27 @@ def main() -> int:
             tool_steps = 0
 
             while tool_steps < MAX_TOOL_STEPS:
-                assistant = manager.chat(
+                assistant, write_model = chat_with_model_retry(
+                    manager,
                     messages,
                     model=write_model,
                     provider=write_provider,
                     create_kwargs=write_kwargs,
                     max_retries=write_retries,
                     stage_name=writing_stage,
+                    project=project,
+                    tools=tools,
+                    chat_delay_seconds=chat_delay_seconds,
+                    chat_delay_state=chat_delay_state,
+                    retry_no_selection_extra_delay_seconds=chat_retry_extra_delay_seconds,
                 )
                 tool_call = parse_tool_call(assistant)
                 if tool_call:
                     tool = tool_call["tool"]
                     approval_needed = tool in {"write_file", "apply_patch", "delete_file"}
+                    print_tool_call_console(tool_call, auto_accept=args.auto_accept, approval_needed=approval_needed)
                     if approval_needed:
-                        if args.auto_accept:
-                            print("🛠️ Auto-approved tool call:")
-                            print(pretty_json(tool_call))
-                        else:
-                            print_hr()
-                            print("🛠️ Model requests tool call (approval required):")
-                            print(pretty_json(tool_call))
-                            print_hr()
+                        if not args.auto_accept:
                             ok = ask_choice("Approve this tool call?", {"y": "yes", "n": "no"}, "y")
                             if ok != "y":
                                 messages.append(msg("assistant", assistant))
@@ -894,9 +1665,13 @@ def main() -> int:
                 todo=todo,
                 quality_report=quality_report,
                 cli_model=args.model,
+                cli_provider=cli_provider_override,
                 cli_temperature=args.temperature,
                 auto_accept=args.auto_accept,
                 max_tool_steps=debug_max_tool_steps,
+                chat_delay_seconds=chat_delay_seconds,
+                chat_delay_state=chat_delay_state,
+                chat_retry_extra_delay_seconds=chat_retry_extra_delay_seconds,
             )
             project.append_accepted(
                 "debug_rounds",
