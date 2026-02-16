@@ -1,5 +1,5 @@
-from .registry import ToolCategory, ToolCategoryMeta, ToolResult, ToolRuntime, tool
-from . import Files as _files  # noqa: F401
+from g4fagent.tools import ToolCategory, ToolCategoryMeta, ToolResult, ToolRuntime, tool
+from g4fagent.tools.files import Files
 
 __all__ = [
     "ToolCategory",
@@ -7,4 +7,5 @@ __all__ = [
     "ToolResult",
     "ToolRuntime",
     "tool",
+    "Files",
 ]

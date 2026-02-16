@@ -13,13 +13,14 @@ manager = G4FManager.from_config()
 
 from __future__ import annotations
 
+from copy import deepcopy
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from .config import load_runtime_config, resolve_pipeline_stages
 from .constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH, G4F_SUPPORTED_CHAT_PARAMS
-from .utils import clamp, deep_merge_dict, format_template, msg, pretty_json
+from .utils import clamp, deep_merge_dict, format_template, msg, now_iso, pretty_json
 
 try:
     import g4f
@@ -61,6 +62,373 @@ def resolve_model_name(name: Optional[str]) -> str:
     if name and name != "default":
         return str(name)
     return getattr(g4f.models, "default", None) or "gpt-3.5-turbo"
+
+
+def enforce_strict_json_object_response_format(response_format: Any) -> Any:
+    """Normalize JSON response formats to strict object-shaped JSON schema.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = enforce_strict_json_object_response_format(...)
+    ```
+    """
+    if response_format is None:
+        return None
+
+    if isinstance(response_format, str):
+        if response_format not in {"json", "json_object"}:
+            return response_format
+        response_format = {"type": response_format}
+
+    if not isinstance(response_format, dict):
+        return response_format
+
+    rf_type = str(response_format.get("type", "")).strip()
+    if rf_type not in {"json", "json_object", "json_schema"}:
+        return response_format
+
+    json_schema: Dict[str, Any] = {}
+    if rf_type == "json_schema":
+        existing_json_schema = response_format.get("json_schema")
+        if isinstance(existing_json_schema, dict):
+            json_schema = dict(existing_json_schema)
+
+    schema = json_schema.get("schema")
+    if not isinstance(schema, dict):
+        schema = {}
+    else:
+        schema = dict(schema)
+
+    # Force object output so downstream code can always parse a JSON object.
+    schema["type"] = "object"
+    schema.setdefault("additionalProperties", True)
+
+    json_schema["name"] = str(json_schema.get("name") or "response")
+    json_schema["strict"] = True
+    json_schema["schema"] = schema
+
+    return {
+        "type": "json_schema",
+        "json_schema": json_schema,
+    }
+
+
+def merge_prompt_media_kwargs(
+    create_kwargs: Optional[Dict[str, Any]],
+    *,
+    image: Any = None,
+    image_name: Optional[str] = None,
+    images: Any = None,
+    media: Any = None,
+) -> Dict[str, Any]:
+    """Merge image/media prompt inputs into g4f create kwargs.
+    
+    Inputs:
+    - Function parameters defined in the function signature.
+    Output:
+    - The function return value as defined by its signature/annotations.
+    Example:
+    ```python
+    result = merge_prompt_media_kwargs(...)
+    ```
+    """
+    kwargs = dict(create_kwargs or {})
+    if media is not None:
+        kwargs["media"] = media
+        kwargs.pop("image", None)
+        kwargs.pop("image_name", None)
+        kwargs.pop("images", None)
+        return kwargs
+
+    if image is not None:
+        kwargs["image"] = image
+        if image_name is not None:
+            kwargs["image_name"] = image_name
+        kwargs.pop("media", None)
+        kwargs.pop("images", None)
+        return kwargs
+
+    if images is not None:
+        kwargs["images"] = images
+        kwargs.pop("media", None)
+        kwargs.pop("image", None)
+        kwargs.pop("image_name", None)
+        return kwargs
+
+    if image_name is not None and kwargs.get("image") is not None:
+        kwargs["image_name"] = image_name
+
+    return kwargs
+
+
+@dataclass
+class ProjectFile:
+    """Represents a tracked file in a generated project.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - ProjectFile: A configured `ProjectFile` instance.
+    Example:
+    ```python
+    obj = ProjectFile(...)
+    ```
+    """
+
+    path: str
+    spec: str = ""
+    content: Optional[str] = None
+    accepted: bool = False
+    status: str = "pending"
+    notes: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize the project file into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "path": self.path,
+            "spec": self.spec,
+            "content": self.content,
+            "accepted": self.accepted,
+            "status": self.status,
+            "notes": self.notes,
+        }
+
+
+@dataclass
+class Project:
+    """Stores accepted artifacts, model interactions, and current runtime state.
+    
+    Inputs:
+    - Constructor fields and initialization parameters defined for this class.
+    Output:
+    - Project: A configured `Project` instance.
+    Example:
+    ```python
+    obj = Project(...)
+    ```
+    """
+
+    name: str = "project"
+    accepted_data: Dict[str, Any] = field(default_factory=dict)
+    chat_history: List[Dict[str, Any]] = field(default_factory=list)
+    state: Dict[str, Any] = field(default_factory=dict)
+    files: List[ProjectFile] = field(default_factory=list)
+
+    def to_dict(self) -> Dict[str, Any]:
+        """Serialize project state into a plain dictionary.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.to_dict(...)
+        ```
+        """
+        return {
+            "name": self.name,
+            "accepted_data": deepcopy(self.accepted_data),
+            "chat_history": deepcopy(self.chat_history),
+            "state": deepcopy(self.state),
+            "files": [f.to_dict() for f in self.files],
+        }
+
+    def set_state(self, key: str, value: Any) -> None:
+        """Set a single project state key.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.set_state(...)
+        ```
+        """
+        self.state[str(key)] = deepcopy(value)
+
+    def update_state(self, updates: Dict[str, Any]) -> None:
+        """Merge multiple keys into current project state.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.update_state(...)
+        ```
+        """
+        if not isinstance(updates, dict):
+            return
+        for k, v in updates.items():
+            self.state[str(k)] = deepcopy(v)
+
+    def accept(self, key: str, value: Any) -> None:
+        """Store accepted data under a top-level key.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.accept(...)
+        ```
+        """
+        self.accepted_data[str(key)] = deepcopy(value)
+
+    def append_accepted(self, key: str, value: Any) -> None:
+        """Append a value into an accepted-data list bucket.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.append_accepted(...)
+        ```
+        """
+        bucket_key = str(key)
+        current = self.accepted_data.get(bucket_key)
+        if current is None:
+            current = []
+            self.accepted_data[bucket_key] = current
+        if not isinstance(current, list):
+            raise TypeError(f"Accepted data key '{bucket_key}' is not a list")
+        current.append(deepcopy(value))
+
+    def set_accepted_entry(self, key: str, entry_key: str, value: Any) -> None:
+        """Set a keyed entry in a map-style accepted-data bucket.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.set_accepted_entry(...)
+        ```
+        """
+        bucket_key = str(key)
+        current = self.accepted_data.get(bucket_key)
+        if current is None:
+            current = {}
+            self.accepted_data[bucket_key] = current
+        if not isinstance(current, dict):
+            raise TypeError(f"Accepted data key '{bucket_key}' is not a dictionary")
+        current[str(entry_key)] = deepcopy(value)
+
+    def get_file(self, path: str) -> Optional[ProjectFile]:
+        """Return a tracked file by path, if present.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_file(...)
+        ```
+        """
+        needle = str(path)
+        for f in self.files:
+            if f.path == needle:
+                return f
+        return None
+
+    def upsert_file(
+        self,
+        path: str,
+        spec: Optional[str] = None,
+        content: Optional[str] = None,
+        accepted: Optional[bool] = None,
+        status: Optional[str] = None,
+        notes: Optional[str] = None,
+    ) -> ProjectFile:
+        """Create/update a tracked project file and return it.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.upsert_file(...)
+        ```
+        """
+        normalized = str(path)
+        f = self.get_file(normalized)
+        if f is None:
+            f = ProjectFile(path=normalized)
+            self.files.append(f)
+        if spec is not None:
+            f.spec = str(spec)
+        if content is not None:
+            f.content = content
+        if accepted is not None:
+            f.accepted = bool(accepted)
+        if status is not None:
+            f.status = str(status)
+        if notes is not None:
+            f.notes = str(notes)
+        return f
+
+    def record_chat(
+        self,
+        *,
+        stage_name: Optional[str],
+        role_name: Optional[str],
+        model: str,
+        provider: Optional[str],
+        messages: Messages,
+        create_kwargs: Optional[Dict[str, Any]],
+        response: Optional[str],
+        error: Optional[str] = None,
+        attempt: Optional[int] = None,
+    ) -> None:
+        """Append a model interaction to chat history.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.record_chat(...)
+        ```
+        """
+        entry: Dict[str, Any] = {
+            "timestamp": now_iso(),
+            "stage": stage_name,
+            "role": role_name,
+            "model": model,
+            "provider": provider,
+            "messages": deepcopy(list(messages)),
+            "create_kwargs": deepcopy(create_kwargs or {}),
+            "response": response,
+        }
+        if error is not None:
+            entry["error"] = str(error)
+        if attempt is not None:
+            entry["attempt"] = int(attempt)
+        self.chat_history.append(entry)
 
 
 @dataclass
@@ -202,6 +570,10 @@ class Agent:
             for k, v in extra_kwargs.items():
                 if v is not None:
                     create_kwargs[k] = v
+        if "response_format" in create_kwargs:
+            create_kwargs["response_format"] = enforce_strict_json_object_response_format(
+                create_kwargs["response_format"]
+            )
         return resolved_model, provider_name, create_kwargs, max_retries
 
 
@@ -587,7 +959,12 @@ class G4FManager:
     ```
     """
 
-    def __init__(self, runtime_cfg: Dict[str, Any], cfg: Optional[LLMConfig] = None):
+    def __init__(
+        self,
+        runtime_cfg: Dict[str, Any],
+        cfg: Optional[LLMConfig] = None,
+        project: Optional[Project] = None,
+    ):
         """Initialize the manager from resolved runtime configuration.
         
         Inputs:
@@ -602,6 +979,7 @@ class G4FManager:
         self.runtime_cfg = runtime_cfg
         default_retries = int((runtime_cfg.get("g4f_defaults", {}) or {}).get("max_retries", 2))
         self.cfg = cfg or LLMConfig(max_retries=default_retries)
+        self.project = project or Project()
 
         loaded_agents = (runtime_cfg.get("loaded_agents", {}) or {})
         self.agents: List[Agent] = [
@@ -613,7 +991,12 @@ class G4FManager:
         self.pipeline = Pipeline.from_runtime_config(runtime_cfg, self._agents_by_role)
 
     @classmethod
-    def from_runtime_config(cls, runtime_cfg: Dict[str, Any], cfg: Optional[LLMConfig] = None) -> "G4FManager":
+    def from_runtime_config(
+        cls,
+        runtime_cfg: Dict[str, Any],
+        cfg: Optional[LLMConfig] = None,
+        project: Optional[Project] = None,
+    ) -> "G4FManager":
         """Create a manager from an in-memory runtime config object.
         
         Inputs:
@@ -625,7 +1008,7 @@ class G4FManager:
         result = instance.from_runtime_config(...)
         ```
         """
-        return cls(runtime_cfg=runtime_cfg, cfg=cfg)
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project)
 
     @classmethod
     def from_config(
@@ -633,6 +1016,7 @@ class G4FManager:
         config_rel_path: str = DEFAULT_CONFIG_REL_PATH,
         base_dir: Path = APP_ROOT,
         cfg: Optional[LLMConfig] = None,
+        project: Optional[Project] = None,
     ) -> "G4FManager":
         """Load configuration from disk and build a manager instance.
         
@@ -646,7 +1030,7 @@ class G4FManager:
         ```
         """
         runtime_cfg = load_runtime_config(base_dir, config_rel_path)
-        return cls(runtime_cfg=runtime_cfg, cfg=cfg)
+        return cls(runtime_cfg=runtime_cfg, cfg=cfg, project=project)
 
     def to_dict(self) -> Dict[str, Any]:
         """Serialize manager state to a dictionary.
@@ -664,7 +1048,22 @@ class G4FManager:
             "agents": [agent.to_dict() for agent in self.agents],
             "pipeline": self.pipeline.to_dict(),
             "meta": dict((self.runtime_cfg.get("_meta", {}) or {})),
+            "project": self.project.to_dict(),
         }
+
+    def get_project(self) -> Project:
+        """Return the mutable project state container.
+        
+        Inputs:
+        - Method parameters defined in the function signature (excluding `self`).
+        Output:
+        - The method return value as defined by its signature/annotations.
+        Example:
+        ```python
+        result = instance.get_project(...)
+        ```
+        """
+        return self.project
 
     def get_runtime_config(self) -> Dict[str, Any]:
         """Return the runtime configuration backing this manager.
@@ -854,6 +1253,11 @@ class G4FManager:
         provider: Optional[str] = None,
         create_kwargs: Optional[Dict[str, Any]] = None,
         max_retries: Optional[int] = None,
+        stage_name: Optional[str] = None,
+        image: Any = None,
+        image_name: Optional[str] = None,
+        images: Any = None,
+        media: Any = None,
     ) -> str:
         """Execute a raw chat completion call through g4f.
         
@@ -866,9 +1270,21 @@ class G4FManager:
         result = instance.chat(...)
         ```
         """
-        create_kwargs = create_kwargs or {}
+        create_kwargs = merge_prompt_media_kwargs(
+            create_kwargs,
+            image=image,
+            image_name=image_name,
+            images=images,
+            media=media,
+        )
         retries = max_retries if max_retries is not None else self.cfg.max_retries
         last_err = None
+        role_name: Optional[str] = None
+        if stage_name:
+            try:
+                role_name = self.get_stage(stage_name).role_name()
+            except Exception:
+                role_name = None
         if self.cfg.log_requests:
             print(f"Calling G4F model: {model} (provider={provider or 'auto'}, max_retries={retries})")
             print(f"Messages (truncated):\n{clamp(pretty_json(messages), 2000)}")
@@ -881,16 +1297,40 @@ class G4FManager:
                     provider=provider,
                     **create_kwargs,
                 )
+                text_response = ""
                 if isinstance(resp, str):
-                    return resp
-                if isinstance(resp, dict):
+                    text_response = resp
+                elif isinstance(resp, dict):
                     try:
-                        return resp["choices"][0]["message"]["content"]
+                        text_response = resp["choices"][0]["message"]["content"]
                     except Exception:
-                        return str(resp)
-                return str(resp)
+                        text_response = str(resp)
+                else:
+                    text_response = str(resp)
+                self.project.record_chat(
+                    stage_name=stage_name,
+                    role_name=role_name,
+                    model=model,
+                    provider=provider,
+                    messages=messages,
+                    create_kwargs=create_kwargs,
+                    response=text_response,
+                    attempt=attempt,
+                )
+                return text_response
             except Exception as e:
                 last_err = e
+                self.project.record_chat(
+                    stage_name=stage_name,
+                    role_name=role_name,
+                    model=model,
+                    provider=provider,
+                    messages=messages,
+                    create_kwargs=create_kwargs,
+                    response=None,
+                    error=str(e),
+                    attempt=attempt,
+                )
                 if attempt <= retries + 1:
                     continue
         raise RuntimeError(f"G4F call failed: {last_err}")
@@ -901,6 +1341,10 @@ class G4FManager:
         template_context: Dict[str, Any],
         cli_model: Optional[str] = None,
         cli_temperature: Optional[float] = None,
+        image: Any = None,
+        image_name: Optional[str] = None,
+        images: Any = None,
+        media: Any = None,
     ) -> str:
         """Execute a stage by building messages/request settings and chatting.
         
@@ -913,16 +1357,24 @@ class G4FManager:
         result = instance.chat_stage(...)
         ```
         """
+        self.project.update_state({"current_stage": stage_name})
         messages = self.build_stage_messages(stage_name, template_context)
         model, provider, create_kwargs, max_retries = self.build_stage_request(
             stage_name=stage_name,
             cli_model=cli_model,
             cli_temperature=cli_temperature,
         )
-        return self.chat(
+        response = self.chat(
             messages=messages,
             model=model,
             provider=provider,
             create_kwargs=create_kwargs,
             max_retries=max_retries,
+            stage_name=stage_name,
+            image=image,
+            image_name=image_name,
+            images=images,
+            media=media,
         )
+        self.project.update_state({"last_completed_stage": stage_name})
+        return response

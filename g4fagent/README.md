@@ -8,6 +8,8 @@
 - `Pipeline`: ordered stages
 - `Stage`: stage-level role binding and overrides
 - `Agent`: role definition and request/message builders
+- `Project`: accepted data, chat history, runtime state, and tracked files
+- `ProjectFile`: per-file tracked metadata stored under `Project.files`
 - `LLMConfig`: runtime execution settings
 
 ## Basic usage
@@ -33,6 +35,34 @@ response = manager.chat_stage(
     template_context={"user_prompt": "Build a CLI todo app"},
 )
 print(response)
+```
+
+## Vision/image prompt example
+
+```python
+response = manager.chat_stage(
+    stage_name="writing",
+    template_context={
+        "project_context_json": "{}",
+        "file_path": "README.md",
+    },
+    image="https://example.com/screenshot.png",
+    image_name="screenshot.png",
+)
+print(response)
+```
+
+## Tool runtime
+
+```python
+from pathlib import Path
+from g4fagent.tools import ToolRuntime
+
+runtime = ToolRuntime(
+    root=Path("."),
+    extra_tool_dirs=["./custom_tools"],  # optional
+)
+print(runtime.available_tools())
 ```
 
 ## Configuration model

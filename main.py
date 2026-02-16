@@ -13,8 +13,9 @@ import zipfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from g4fagent import G4FManager
+from g4fagent import G4FManager, Project
 from g4fagent.constants import APP_ROOT, DEFAULT_CONFIG_REL_PATH
+from g4fagent.tools import ToolResult, ToolRuntime
 from g4fagent.utils import (
     ask_choice,
     clamp,
@@ -31,13 +32,23 @@ from g4fagent.utils import (
     show_tree,
     unified_diff_str,
 )
-from tools import ToolResult, ToolRuntime
 
 
 def run_tool(tools: ToolRuntime, call: Dict[str, Any]) -> ToolResult:
     tool = call.get("tool")
     args = call.get("args") or {}
     return tools.execute(str(tool), args)
+
+
+def persist_project_state(tools: ToolRuntime, project: Project) -> None:
+    tools.execute(
+        "write_file",
+        {
+            "path": "PROJECT_STATE.json",
+            "content": pretty_json(project.to_dict()) + "\n",
+            "overwrite": True,
+        },
+    )
 
 
 def main() -> int:
@@ -55,6 +66,12 @@ def main() -> int:
         action="store_true",
         help="Skip per-file and tool-call approvals; write files immediately and run one final verification",
     )
+    ap.add_argument(
+        "--tools-dir",
+        action="append",
+        default=[],
+        help="Additional directory containing custom tool modules (*.py). Can be repeated.",
+    )
     ap.add_argument("--temperature", type=float, default=None, help="Sampling temperature override for all stages")
     args = ap.parse_args()
 
@@ -63,7 +80,30 @@ def main() -> int:
 
     manager = G4FManager.from_config(config_rel_path=args.config, base_dir=APP_ROOT)
     planning_stage, writing_stage = manager.default_stage_names()
-    tools = ToolRuntime(out_dir)
+    try:
+        tools = ToolRuntime(out_dir, extra_tool_dirs=args.tools_dir)
+    except Exception as e:
+        print(f"Failed to initialize tools: {e}")
+        return 1
+    project = manager.get_project()
+    project.name = out_dir.name
+    project.update_state(
+        {
+            "status": "initialized",
+            "output_dir": str(out_dir),
+            "config_path": str(manager.runtime_cfg["_meta"]["config_path"]),
+            "agents_dir": str(manager.runtime_cfg["_meta"]["agents_dir"]),
+            "planning_stage": planning_stage,
+            "writing_stage": writing_stage,
+            "mode": "auto-accept" if args.auto_accept else "interactive",
+            "extra_tools_dirs": list(args.tools_dir or []),
+            "available_tools": tools.available_tools(),
+            "loaded_tool_modules": tools.loaded_modules(),
+            "current_stage": None,
+            "current_file": None,
+        }
+    )
+    persist_project_state(tools, project)
 
     print_hr()
     print("🧪 Agentic G4F Scaffolder")
@@ -71,6 +111,10 @@ def main() -> int:
     print(f"Output: {out_dir}")
     print(f"Config: {manager.runtime_cfg['_meta']['config_path']}")
     print(f"Agents dir: {manager.runtime_cfg['_meta']['agents_dir']}")
+    if args.tools_dir:
+        print(f"Extra tools dirs: {', '.join(args.tools_dir)}")
+        if tools.loaded_modules():
+            print(f"Loaded external tool modules: {', '.join(tools.loaded_modules())}")
     print(f"Pipeline order: {planning_stage} -> {writing_stage}")
     print(
         f"{planning_stage} role/model/provider: "
@@ -91,6 +135,9 @@ def main() -> int:
     if not user_prompt:
         print("No prompt provided. Exiting.")
         return 1
+    project.accept("user_prompt", user_prompt)
+    project.update_state({"status": "planning", "current_stage": planning_stage})
+    persist_project_state(tools, project)
 
     plan_messages = manager.build_stage_messages(
         planning_stage,
@@ -112,6 +159,7 @@ def main() -> int:
         provider=plan_provider,
         create_kwargs=plan_kwargs,
         max_retries=plan_retries,
+        stage_name=planning_stage,
     )
     plan_text_clean, plan_obj = extract_plan_json(plan_text)
 
@@ -132,10 +180,13 @@ def main() -> int:
             provider=plan_provider,
             create_kwargs=plan_kwargs,
             max_retries=plan_retries,
+            stage_name=planning_stage,
         )
         _, plan_obj = extract_plan_json(fix)
         if not plan_obj:
             print("Still no valid plan JSON. Exiting to avoid chaos.")
+            project.update_state({"status": "failed", "reason": "plan_json_missing"})
+            persist_project_state(tools, project)
             return 2
 
     while True:
@@ -147,6 +198,8 @@ def main() -> int:
         if choice == "a":
             break
         if choice == "q":
+            project.update_state({"status": "cancelled", "reason": "plan_rejected"})
+            persist_project_state(tools, project)
             return 0
         fb = prompt_multiline("Enter feedback to amend the plan.")
         amend_messages = plan_messages + [
@@ -159,6 +212,7 @@ def main() -> int:
             provider=plan_provider,
             create_kwargs=plan_kwargs,
             max_retries=plan_retries,
+            stage_name=planning_stage,
         )
         plan_text_clean, plan_obj = extract_plan_json(plan_text)
         print_hr()
@@ -171,6 +225,8 @@ def main() -> int:
 
     if plan_obj is None:
         print("No valid plan JSON available after approval loop. Exiting.")
+        project.update_state({"status": "failed", "reason": "no_plan_json_after_approval"})
+        persist_project_state(tools, project)
         return 2
 
     todo = plan_obj.get("todo", [])
@@ -178,6 +234,8 @@ def main() -> int:
 
     if not isinstance(files, list) or not files:
         print("No files in plan JSON. Exiting.")
+        project.update_state({"status": "failed", "reason": "no_files_in_plan"})
+        persist_project_state(tools, project)
         return 3
 
     expected_files: List[str] = []
@@ -189,9 +247,37 @@ def main() -> int:
                     expected_files.append(str(ensure_rel_path(p)))
                 except ValueError:
                     continue
+    project.accept(
+        "plan",
+        {
+            "text": plan_text_clean,
+            "json": plan_obj,
+            "todo": todo,
+            "expected_files": expected_files,
+        },
+    )
+    for f in files:
+        if not isinstance(f, dict):
+            continue
+        p = f.get("path")
+        if not isinstance(p, str) or not p:
+            continue
+        try:
+            rel = str(ensure_rel_path(p))
+        except ValueError:
+            continue
+        project.upsert_file(rel, spec=str(f.get("spec", "") or ""))
+    project.update_state(
+        {
+            "status": "writing",
+            "current_stage": writing_stage,
+            "total_planned_files": len(expected_files),
+        }
+    )
 
     tools.execute("write_file", {"path": "PROJECT_PLAN.md", "content": plan_text_clean + "\n", "overwrite": True})
     tools.execute("write_file", {"path": "PROJECT_PLAN.json", "content": pretty_json(plan_obj) + "\n", "overwrite": True})
+    persist_project_state(tools, project)
 
     print_hr()
     print("✍️ Writing files one-by-one with approval.")
@@ -214,6 +300,8 @@ def main() -> int:
         rel = str(ensure_rel_path(path))
         abs_path = out_dir / rel
         abs_path.parent.mkdir(parents=True, exist_ok=True)
+        project.update_state({"current_file": rel, "files_processed": idx - 1})
+        project.upsert_file(rel, spec=str(spec or ""), status="in_progress")
 
         print_hr()
         print(f"🧩 File {idx}/{len(files)}: {rel}")
@@ -258,6 +346,7 @@ def main() -> int:
                 provider=write_provider,
                 create_kwargs=write_kwargs,
                 max_retries=write_retries,
+                stage_name=writing_stage,
             )
             tool_call = parse_tool_call(assistant)
             if tool_call:
@@ -279,10 +368,13 @@ def main() -> int:
                             tool_steps += 1
                             continue
 
+                project.append_accepted("tool_calls", tool_call)
+                project.set_state("last_approved_tool", tool)
                 res = run_tool(tools, tool_call)
                 messages.append(msg("assistant", assistant))
                 messages.append(msg("user", f"Tool result (ok={res.ok}):\n{clamp(res.output, 4000)}"))
                 tool_steps += 1
+                persist_project_state(tools, project)
                 continue
 
             content_candidate = sanitize_generated_file_content(assistant)
@@ -290,6 +382,9 @@ def main() -> int:
 
         if content_candidate is None:
             print("⚠️ Could not obtain file content. Skipping.")
+            project.upsert_file(rel, status="skipped", notes="No content candidate produced")
+            project.set_state("files_processed", idx)
+            persist_project_state(tools, project)
             continue
 
         print_hr()
@@ -312,6 +407,11 @@ def main() -> int:
             if args.auto_accept:
                 tools.execute("write_file", {"path": rel, "content": current_content, "overwrite": True})
                 print(f"✅ Wrote {rel} (auto-accept)")
+                project.upsert_file(rel, content=current_content, accepted=True, status="written")
+                project.set_accepted_entry("files", rel, current_content)
+                project.append_accepted("accepted_files", rel)
+                project.set_state("files_processed", idx)
+                persist_project_state(tools, project)
                 break
 
             act = ask_choice(
@@ -322,12 +422,22 @@ def main() -> int:
             if act == "a":
                 tools.execute("write_file", {"path": rel, "content": current_content, "overwrite": True})
                 print(f"✅ Wrote {rel}")
+                project.upsert_file(rel, content=current_content, accepted=True, status="written")
+                project.set_accepted_entry("files", rel, current_content)
+                project.append_accepted("accepted_files", rel)
+                project.set_state("files_processed", idx)
+                persist_project_state(tools, project)
                 break
             if act == "s":
                 print(f"⏭️ Skipped {rel}")
+                project.upsert_file(rel, accepted=False, status="skipped", notes="Skipped by user")
+                project.set_state("files_processed", idx)
+                persist_project_state(tools, project)
                 break
             if act == "q":
                 print("Stopping early.")
+                project.update_state({"status": "cancelled", "reason": "user_quit_during_writing"})
+                persist_project_state(tools, project)
                 if args.zip:
                     make_zip(out_dir)
                 return 0
@@ -348,6 +458,7 @@ def main() -> int:
                     provider=write_provider,
                     create_kwargs=write_kwargs,
                     max_retries=write_retries,
+                    stage_name=writing_stage,
                 )
                 tool_call = parse_tool_call(assistant)
                 if tool_call:
@@ -368,16 +479,21 @@ def main() -> int:
                                 messages.append(msg("user", "Tool call denied by user. Provide another approach."))
                                 tool_steps += 1
                                 continue
+                    project.append_accepted("tool_calls", tool_call)
+                    project.set_state("last_approved_tool", tool)
                     res = run_tool(tools, tool_call)
                     messages.append(msg("assistant", assistant))
                     messages.append(msg("user", f"Tool result (ok={res.ok}):\n{clamp(res.output, 4000)}"))
                     tool_steps += 1
+                    persist_project_state(tools, project)
                     continue
                 content_candidate = sanitize_generated_file_content(assistant)
                 break
 
             if content_candidate is None:
                 print("⚠️ Regeneration failed; you can try feedback again or skip.")
+                project.upsert_file(rel, status="retry_needed", notes="Regeneration failed")
+                persist_project_state(tools, project)
                 continue
 
             existing = abs_path.read_text(encoding="utf-8", errors="replace") if abs_path.exists() else None
@@ -398,6 +514,9 @@ def main() -> int:
         print(verification_report)
         if not ok:
             print("⚠️ Final verification failed. Review issues above.")
+        project.accept("final_verification", {"ok": ok, "report": verification_report})
+        project.set_state("verification_ok", bool(ok))
+        persist_project_state(tools, project)
         print_hr()
 
     print_hr()
@@ -408,7 +527,10 @@ def main() -> int:
     if args.zip:
         zip_path = make_zip(out_dir)
         print(f"📦 Zip created: {zip_path}")
+        project.update_state({"zip_path": str(zip_path)})
 
+    project.update_state({"status": "completed", "current_stage": None, "current_file": None})
+    persist_project_state(tools, project)
     print("✨ Finished.")
     return 0
 
